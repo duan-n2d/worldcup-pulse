@@ -1,0 +1,10 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local runtime data - never commit generated lakehouse data to code repo
+data/
+.env
+.DS_Store
