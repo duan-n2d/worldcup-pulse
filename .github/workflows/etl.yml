@@ -1,23 +1,29 @@
 name: WorldCup Pulse ETL
 
+# The tournament has finished, so the 30-minute schedule is disabled.
+# Trigger manually, or via repository_dispatch from the Cloudflare Worker.
 on:
   repository_dispatch:
     types: [run-etl]
   workflow_dispatch:
-  schedule:
-    - cron: "*/30 * * * *"
+  # schedule:
+  #   - cron: "*/30 * * * *"
 
 jobs:
   run-etl:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    defaults:
+      run:
+        working-directory: lakehouse
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
+          cache-dependency-path: lakehouse/requirements.txt
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Run incremental ETL and upload to Hugging Face Dataset

@@ -1,84 +1,77 @@
-# WorldCup Pulse Lakehouse
+# WorldCup Pulse
 
-A free-tier, cloud-automated, near-real-time Data Engineering portfolio project for FIFA World Cup 2026.
+A free-tier, cloud-automated, near-real-time data platform for the FIFA World Cup 2026. A serverless cron triggers an incremental ETL that builds a Bronze/Silver/Gold Parquet lakehouse, publishes it to a Hugging Face Dataset as decoupled storage, and serves it to two stateless Streamlit apps: a public BI app and a DataOps monitor.
+
+> **Status:** the tournament has ended (July 2026). The scheduled refresh is disabled; the ETL can still be run on demand from the Actions tab.
 
 ## Architecture
 
-```text
-WorldCup26 API
-  -> GitHub Actions ETL
-  -> Bronze / Silver / Gold parquet lakehouse
-  -> Hugging Face Dataset repo as decoupled storage
-  -> Two Hugging Face Spaces
-      - worldcup-pulse-overview
-      - worldcup-pulse-dataops
+```mermaid
+flowchart LR
+    CF[Cloudflare Worker<br/>cron every 5 min] -->|repository_dispatch| GA[GitHub Actions<br/>incremental ETL]
+    API[(WorldCup26 API)] --> GA
+    GA --> B[Bronze<br/>raw snapshots]
+    B --> S[Silver<br/>canonical entities]
+    S --> G[Gold<br/>15 BI marts]
+    GA --> Q[Quality checks<br/>+ run logs]
+    G --> HF[(Hugging Face Dataset<br/>single source of truth)]
+    Q --> HF
+    HF --> OV[Overview app<br/>BI · Streamlit]
+    HF --> OPS[DataOps app<br/>monitoring · DuckDB console]
 ```
 
-## Why this is a Data Engineering project
+## Engineering highlights
 
-- Cloud automation with Cloudflare Worker cron and GitHub Actions
-- Incremental pipeline mode
-- Decoupled storage: code stays in GitHub, data lives in Hugging Face Dataset
-- Bronze/Silver/Gold lakehouse layers
-- Parquet data marts for fast DuckDB reads
-- Data quality checks and pipeline audit logs
-- Stateless Streamlit UI that pulls from the Dataset repo
+- **Fully serverless, $0 to run** — Cloudflare Workers cron, GitHub Actions compute, Hugging Face storage and hosting.
+- **Incremental processing** with watermark state (`state/last_run.json`) instead of full reloads.
+- **Decoupled storage** — the code repo never commits data; the HF Dataset repo is the only place lakehouse files live.
+- **Medallion layers** in Parquet, read by DuckDB in the apps for fast, serverless queries.
+- **Data quality and auditability** — per-run checks by layer/table and a pipeline run log, surfaced in the DataOps app.
+- **Stateless UIs** with a 5-minute cache and mock fallback data, so apps demo before the first ETL lands.
 
-## Updated marts for the expanded BI app
-
-The updated `worldcup-pulse-overview/app.py` uses extra pages for Match Center, Group Standings, Player Leaderboard, and Venues. The ETL now produces the related gold marts:
+## Repository layout
 
 ```text
-gold/matches.parquet
-gold/group_standings.parquet
-gold/match_events.parquet
-gold/substitutions.parquet
-gold/lineups.parquet
-gold/goalkeepers.parquet
-gold/match_player_stats.parquet
+lakehouse/
+  pipelines/          ingest → bronze → silver → gold → quality checks → upload_to_hf
+  cloud/              Cloudflare Worker that dispatches the ETL workflow
+  requirements.txt
+apps/
+  overview/           Public BI app: overview, match center, standings, teams, players, venues
+  dataops/            Pipeline heartbeat, quality-check tabs, DuckDB console over gold marts
+docs/
+  lakehouse-deployment.md   End-to-end deployment checklist and secrets
+  hf-dataset-card.md        Dataset card: lakehouse layout and every gold mart
+.github/workflows/etl.yml   ETL job (dispatch / manual)
 ```
 
-The original marts are still produced:
-
-```text
-gold/kpi_summary.parquet
-gold/goals_by_matchday.parquet
-gold/goals_by_minute_bucket.parquet
-gold/host_cities.parquet
-gold/team_radar_stats.parquet
-gold/team_key_metrics.parquet
-gold/top_players.parquet
-gold/team_table.parquet
-```
-
-## Local run
+## Run locally
 
 ```bash
-python -m venv .venv
-.venv\Scripts\activate  # Windows PowerShell after Set-ExecutionPolicy -Scope Process RemoteSigned
-python -m pip install -r requirements.txt
-python pipelines/run_pipeline.py --source worldcup26 --mode incremental
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r lakehouse/requirements.txt
+cd lakehouse && python pipelines/run_pipeline.py --source worldcup26 --mode incremental
 ```
 
-Without `HF_TOKEN` and `HF_DATASET_REPO`, the pipeline still runs locally and writes to `data/`. With those variables set, it uploads the generated lakehouse data to the HF Dataset repo.
+Without `HF_TOKEN` and `HF_DATASET_REPO` the pipeline writes to `lakehouse/data/` only. To run an app:
 
-## GitHub Actions secrets
+```bash
+pip install -r apps/overview/requirements.txt
+streamlit run apps/overview/app.py
+```
 
-- `HF_TOKEN`
-- `HF_DATASET_REPO`
+## Deploy
 
-## Cloudflare Worker secrets
+See [docs/lakehouse-deployment.md](docs/lakehouse-deployment.md) for the full checklist: HF Dataset repo, GitHub secrets (`HF_TOKEN`, `HF_DATASET_REPO`), the two Spaces (`apps/overview`, `apps/dataops`), and the Cloudflare Worker secrets (`GITHUB_TOKEN`, `GITHUB_REPO`).
 
-- `GITHUB_TOKEN`
-- `GITHUB_REPO`
+## Gold marts
 
-## Deployment checklist
+Tournament KPIs, goals by matchday and minute bucket, host cities, team radar and key metrics, player leaderboard, team table, matches, group standings, match events, substitutions, lineups, goalkeepers, and per-match player stats. Column-level descriptions are in [docs/hf-dataset-card.md](docs/hf-dataset-card.md).
 
-1. Create HF Dataset repo `worldcup-pulse-data`.
-2. Push this folder to GitHub repo `worldcup-pulse-lakehouse`.
-3. Add `HF_TOKEN` and `HF_DATASET_REPO` to GitHub Secrets.
-4. Run the GitHub Actions `workflow_dispatch` once.
-5. Deploy `worldcup-pulse-overview` and `worldcup-pulse-dataops` as two Hugging Face Spaces.
-6. Set `HF_DATASET_REPO` and optionally `HF_TOKEN` in both Spaces.
-7. Deploy the Cloudflare Worker cron.
-8. Verify: Cloudflare cron -> GitHub dispatch -> ETL upload -> HF Dataset -> Spaces refresh within 300 seconds.
+## Tech stack
+
+Python · pandas · PyArrow · DuckDB · Streamlit · Plotly · GitHub Actions · Cloudflare Workers · Hugging Face Hub
+
+## License
+
+[MIT](LICENSE)
