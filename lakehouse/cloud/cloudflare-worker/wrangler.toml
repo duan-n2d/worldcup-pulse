@@ -2,5 +2,14 @@ name = "worldcup-pulse-etl-trigger"
 main = "src/index.js"
 compatibility_date = "2025-01-01"
 
+# The scheduled refresh is disabled now that the tournament has ended.
+# An explicit empty list removes any previously deployed cron on `wrangler deploy`
+# (omitting [triggers] would leave an old cron in place).
+# To re-enable, e.g.: crons = ["*/30 * * * *"]
 [triggers]
-crons = ["*/5 * * * *"]
+crons = []
+
+# Secrets (set with `wrangler secret put <NAME>`, never committed):
+#   TRIGGER_TOKEN  - shared secret required as `Authorization: Bearer <token>` on HTTP triggers
+#   GITHUB_TOKEN   - token allowed to call repository_dispatch on GITHUB_REPO
+#   GITHUB_REPO    - "owner/repo"
