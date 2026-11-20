@@ -62,27 +62,36 @@ def _mock_payload() -> dict[str, Any]:
     return {"teams": teams, "groups": [], "games": games, "stadiums": stadiums}
 
 
-def ingest_worldcup26(mode: str = "incremental") -> dict[str, Path]:
+def ingest_worldcup26(mode: str = "full", use_mock: bool = False) -> dict[str, Path]:
+    """Pull every endpoint in full and write a raw snapshot.
+
+    Any API error fails the run. The bundled mock payload is only used when the
+    caller explicitly opts in (``--use-mock`` / ``WORLDCUP_USE_MOCK=1``); the
+    manifest then records ``used_mock`` so the upload step can refuse it.
+    """
     run_ts = compact_ts()
     snapshot_dir = RAW_DIR / f"worldcup26_{run_ts}"
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     manifest = {"source": "worldcup26", "mode": mode, "ingested_at": iso_now(), "files": {}}
     payloads: dict[str, Any] = {}
-    used_mock = False
-    for name, endpoint in ENDPOINTS.items():
-        try:
-            payloads[name] = _safe_get(endpoint)
-        except Exception as exc:
-            used_mock = True
-            payloads = _mock_payload()
-            manifest["warning"] = f"API fallback mock used because endpoint {endpoint} failed: {exc}"
-            break
+    if use_mock:
+        payloads = _mock_payload()
+        manifest["warning"] = "Mock payload used by explicit opt-in; this snapshot must not be published."
+    else:
+        for name, endpoint in ENDPOINTS.items():
+            try:
+                payloads[name] = _safe_get(endpoint)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"WorldCup26 API request for '{endpoint}' failed: {exc}. "
+                    "Re-run with --use-mock (or WORLDCUP_USE_MOCK=1) for an offline demo; mock data is never uploaded."
+                ) from exc
     paths: dict[str, Path] = {}
     for name, payload in payloads.items():
         path = snapshot_dir / f"{name}.json"
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         manifest["files"][name] = str(path)
         paths[name] = path
-    manifest["used_mock"] = used_mock
+    manifest["used_mock"] = use_mock
     write_json(snapshot_dir / "manifest.json", manifest)
     return paths

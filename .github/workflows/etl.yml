@@ -26,8 +26,8 @@ jobs:
           cache-dependency-path: lakehouse/requirements.txt
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Run incremental ETL and upload to Hugging Face Dataset
+      - name: Run ETL (full pull) and upload to Hugging Face Dataset
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
-        run: python pipelines/run_pipeline.py --source worldcup26 --mode incremental
+        run: python pipelines/run_pipeline.py --source worldcup26 --mode full

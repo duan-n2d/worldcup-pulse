@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import uuid
 from datetime import datetime, timezone
 
@@ -13,7 +14,7 @@ from silver import build_silver
 from upload_to_hf import download_state_from_hf, upload_data_to_hf
 
 
-def run(source: str, mode: str) -> dict:
+def run(source: str, mode: str, use_mock: bool = False) -> dict:
     if source != "worldcup26":
         raise ValueError("Only --source worldcup26 is supported")
     run_id = f"{compact_ts()}_{uuid.uuid4().hex[:8]}"
@@ -21,12 +22,11 @@ def run(source: str, mode: str) -> dict:
     row = {"run_id": run_id, "started_at": started.isoformat(), "finished_at": "", "status": "Running", "rows_bronze": 0, "rows_silver": 0, "rows_gold": 0, "error_message": ""}
     try:
         # Best effort: local pipeline should still work without HF secrets.
-        import os
         repo = os.environ.get("HF_DATASET_REPO", "your-username/worldcup-pulse-data")
         token = os.environ.get("HF_TOKEN")
         download_state_from_hf(repo, token)
 
-        raw_paths = ingest_worldcup26(mode=mode)
+        raw_paths = ingest_worldcup26(mode=mode, use_mock=use_mock)
         bronze = build_bronze(raw_paths)
         silver = build_silver()
         gold = build_gold()
@@ -34,7 +34,7 @@ def run(source: str, mode: str) -> dict:
         if not quality_passed:
             failed = quality_report[quality_report["status"].eq("Fail")]
             raise RuntimeError("Data quality failed: " + "; ".join(failed["table"].astype(str) + "." + failed["check_name"].astype(str) + "=" + failed["message"].astype(str)))
-        upload_status = upload_data_to_hf(repo, token)
+        upload_status = upload_data_to_hf(repo, token, used_mock=use_mock)
         row.update({
             "status": "Success" if upload_status == "UPLOADED" else "SuccessLocalNoUpload",
             "rows_bronze": sum(len(x) for x in bronze.values()),
@@ -42,7 +42,7 @@ def run(source: str, mode: str) -> dict:
             "rows_gold": sum(len(x) for x in gold.values()),
             "error_message": "" if upload_status == "UPLOADED" else upload_status,
         })
-        write_json(STATE_DIR / "last_run.json", {"last_successful_run_id": run_id, "last_successful_at": iso_now(), "source": source, "mode": mode})
+        write_json(STATE_DIR / "last_run.json", {"last_successful_run_id": run_id, "last_successful_at": iso_now(), "source": source, "mode": mode, "used_mock": use_mock})
         return row
     except Exception as exc:
         row.update({"status": "Fail", "error_message": str(exc)})
@@ -56,6 +56,13 @@ def run(source: str, mode: str) -> dict:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", default="worldcup26")
-    parser.add_argument("--mode", choices=["incremental", "full"], default="incremental")
+    # Every run pulls each endpoint in full; --mode is only recorded in the manifest and run log.
+    parser.add_argument("--mode", choices=["incremental", "full"], default="full")
+    parser.add_argument(
+        "--use-mock",
+        action="store_true",
+        default=os.environ.get("WORLDCUP_USE_MOCK", "").strip().lower() in {"1", "true", "yes"},
+        help="Use the bundled mock payload instead of the API (offline demo only; never uploaded). Also WORLDCUP_USE_MOCK=1.",
+    )
     args = parser.parse_args()
-    run(args.source, args.mode)
+    run(args.source, args.mode, use_mock=args.use_mock)
