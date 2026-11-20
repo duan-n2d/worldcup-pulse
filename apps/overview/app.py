@@ -6,7 +6,6 @@ from datetime import datetime
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import requests
 import streamlit as st
 
 from data_access import begin_mock_tracking, load_gold_table, render_mock_banner
@@ -128,23 +127,6 @@ def safe_load(table: str) -> tuple[pd.DataFrame, bool]:
         return df, (df is not None and not df.empty)
     except Exception:
         return pd.DataFrame(), False
-
-
-def trigger_etl() -> tuple[bool, str]:
-    repo = os.environ.get("GITHUB_REPO", "")
-    token = os.environ.get("GITHUB_TOKEN", "")
-    if not repo or not token:
-        return False, "Missing GITHUB_REPO or GITHUB_TOKEN Space secret."
-    try:
-        r = requests.post(
-            f"https://api.github.com/repos/{repo}/dispatches",
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json", "User-Agent": "worldcup-pulse-space"},
-            json={"event_type": "run-etl", "client_payload": {"source": "space_button"}},
-            timeout=20,
-        )
-        return r.ok, f"GitHub dispatch status={r.status_code}"
-    except Exception as exc:
-        return False, str(exc)
 
 
 def hero(title: str, subtitle: str):
@@ -294,9 +276,6 @@ def sidebar() -> str:
             st.sidebar.markdown(f'<div class="ghost">🔴 {live_n} {label} live now</div>', unsafe_allow_html=True)
 
     st.sidebar.markdown('<div class="sidebar-logo"><div style="font-size:2.2rem">🏆⚽</div><b>FIFA World Cup 2026</b><br><span style="color:#9DB4C8;font-size:.8rem">Canada · Mexico · USA</span></div>', unsafe_allow_html=True)
-    if st.sidebar.button("Trigger ETL Pipeline", use_container_width=True):
-        ok2, msg = trigger_etl()
-        st.toast(("✅ " if ok2 else "⚠️ ") + msg)
     st.sidebar.caption("Data source: HF Dataset lakehouse · cache ttl 300s")
     return page
 

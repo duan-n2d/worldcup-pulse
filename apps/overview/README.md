@@ -29,6 +29,6 @@ If the HF Dataset cannot be read, the app falls back to built-in mock data so th
 ## Required Space secrets
 
 - `HF_DATASET_REPO`: e.g. `your-username/worldcup-pulse-data`
-- `HF_TOKEN`: only needed if the Dataset repo is private
-- `GITHUB_REPO`: optional, enables the Trigger ETL button
-- `GITHUB_TOKEN`: optional, enables the Trigger ETL button
+- `HF_TOKEN`: only needed if the Dataset repo is private (use a read-only token)
+
+The Space never holds a GitHub token. To refresh data, trigger the ETL from GitHub Actions (`workflow_dispatch`) or via the token-protected Cloudflare Worker.
