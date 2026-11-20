@@ -87,11 +87,8 @@ def _stadiums(stadiums: pd.DataFrame) -> pd.DataFrame:
         })
     df = pd.DataFrame(rows)
     if df.empty:
-        df = pd.DataFrame([
-            {"stadium_id":"METLIFE","stadium":"MetLife Stadium","city":"New York/New Jersey","country":"USA","lat":40.8135,"lon":-74.0745},
-            {"stadium_id":"AZTECA","stadium":"Estadio Azteca","city":"Mexico City","country":"Mexico","lat":19.3029,"lon":-99.1505},
-            {"stadium_id":"BCPLACE","stadium":"BC Place","city":"Vancouver","country":"Canada","lat":49.2768,"lon":-123.1119},
-        ])
+        # No stadiums in the source payload: publish an empty table rather than invented venues.
+        return pd.DataFrame(columns=["stadium_id", "stadium", "city", "country", "lat", "lon"])
     return df.drop_duplicates("stadium_id")
 
 
@@ -103,6 +100,24 @@ def _extract_score(row: pd.Series, keys: list[str]) -> int | None:
         return int(float(value))
     except Exception:
         return None
+
+
+# Per-team match stats are only kept when the source payload carries them
+# (e.g. ``home_xg`` / ``away_possession``). Nothing is derived or invented:
+# a stat the API does not provide stays null.
+SIDE_STATS = {
+    "xg": ["xg", "expected_goals"],
+    "shots": ["shots", "total_shots"],
+    "possession_pct": ["possession", "possession_pct", "ball_possession"],
+    "pass_accuracy_pct": ["pass_accuracy", "pass_accuracy_pct", "passes_accuracy"],
+    "cards": ["cards"],
+}
+
+
+def _side_stat(row: pd.Series, side: str, names: list[str]) -> float | None:
+    keys = [f"{side}_{n}" for n in names] + [f"{side}Team_{n}" for n in names] + [f"stats_{side}_{n}" for n in names]
+    value = pd.to_numeric(pd.Series([_row_get(row, keys, None)]), errors="coerce").iloc[0]
+    return None if pd.isna(value) else float(value)
 
 
 def build_silver() -> dict[str, pd.DataFrame]:
@@ -135,6 +150,7 @@ def build_silver() -> dict[str, pd.DataFrame]:
         status = clean_text(_row_get(row, ["status", "state"], "scheduled")) or "scheduled"
         city = clean_text(_row_get(row, ["city", "venue_city"], "Unknown"))
         stadium = clean_text(_row_get(row, ["stadium", "venue", "stadium_name"], "Unknown Stadium"))
+        attendance = pd.to_numeric(pd.Series([_row_get(row, ["attendance", "spectators"], None)]), errors="coerce").iloc[0]
         matches.append({
             "match_id": match_id,
             "match_number": _row_get(row, ["match_number", "id"], match_id),
@@ -150,43 +166,46 @@ def build_silver() -> dict[str, pd.DataFrame]:
             "stadium": stadium,
             "city": city,
             "kickoff_utc": clean_text(_row_get(row, ["date", "datetime", "kickoff", "time"], "")),
+            "attendance": None if pd.isna(attendance) else int(attendance),
         })
         if home_id in valid_team_ids and away_id in valid_team_ids and home_score is not None and away_score is not None:
-            for team_id, goals_for, goals_against in [(home_id, home_score, away_score), (away_id, away_score, home_score)]:
-                base = sum(ord(c) for c in f"{match_id}{team_id}")
+            for side, team_id, goals_for, goals_against in [("home", home_id, home_score, away_score), ("away", away_id, away_score, home_score)]:
                 stats_rows.append({
                     "match_id": match_id,
                     "team_id": team_id,
                     "goals_for": goals_for,
                     "goals_against": goals_against,
-                    "xg": round(max(0.2, goals_for * 0.75 + (base % 8) / 10), 2),
-                    "shots": int(6 + goals_for * 3 + base % 9),
-                    "possession_pct": int(42 + base % 19),
-                    "pass_accuracy_pct": int(74 + base % 18),
-                    "cards": int(base % 4),
+                    **{stat: _side_stat(row, side, names) for stat, names in SIDE_STATS.items()},
                 })
-        # events from goals if present, otherwise synthesize from score
+        # Events only come from the source's goal/event list; none are synthesized from the score.
         goal_list = _row_get(row, ["goals", "scorers", "events"], None)
+        if hasattr(goal_list, "tolist") and not isinstance(goal_list, list):
+            goal_list = goal_list.tolist()
         if not isinstance(goal_list, list):
             goal_list = []
-            for team_id, score in [(home_id, home_score or 0), (away_id, away_score or 0)]:
-                for g in range(int(score)):
-                    goal_list.append({"minute": 12 + ((g * 17 + matchday * 3) % 78), "team": team_id, "player": f"{team_id} Player {g+1}", "type": "goal"})
         for i, ev in enumerate(goal_list):
-            team_raw = first_present(ev, ["team", "team_name", "team_id"], home_id) if isinstance(ev, dict) else home_id
+            if not isinstance(ev, dict):
+                continue
+            team_raw = first_present(ev, ["team", "team_name", "team_id"], None)
+            if team_raw is None:
+                continue
             team_id = _resolve_team(team_raw, alias)
             if team_id not in valid_team_ids:
                 continue
-            minute = first_present(ev, ["minute", "time", "elapsed"], 0) if isinstance(ev, dict) else 0
+            minute = first_present(ev, ["minute", "time", "elapsed"], None)
             try: minute = int(float(minute))
-            except Exception: minute = 0
-            player = clean_text(first_present(ev, ["player", "player_name", "scorer"], f"{team_id} Player") if isinstance(ev, dict) else f"{team_id} Player")
-            events.append({"event_id": f"{match_id}_{i+1}", "match_id": match_id, "team_id": team_id, "player": player, "event_type": "goal", "minute": minute})
-            players.append({"player_id": canonical_id(f"{team_id}_{player}"), "player": player, "team_id": team_id, "position": "Forward"})
+            except Exception: minute = None
+            player = clean_text(first_present(ev, ["player", "player_name", "scorer"], ""))
+            assist = clean_text(first_present(ev, ["assist", "assist_player", "assist_name"], ""))
+            event_type = clean_text(first_present(ev, ["type", "event_type", "kind"], "goal")).lower() or "goal"
+            events.append({"event_id": f"{match_id}_{i+1}", "match_id": match_id, "team_id": team_id, "player": player or None, "assist_player": assist or None, "event_type": event_type, "minute": minute})
+            if player:
+                position = clean_text(first_present(ev, ["position", "player_position"], ""))
+                players.append({"player_id": canonical_id(f"{team_id}_{player}"), "player": player, "team_id": team_id, "position": position or None})
     matches_df = pd.DataFrame(matches)
     slots_df = pd.DataFrame(slots).drop_duplicates("slot_id") if slots else pd.DataFrame(columns=["slot_id","slot_label","stage","match_id"])
-    stats_df = pd.DataFrame(stats_rows)
-    events_df = pd.DataFrame(events)
+    stats_df = pd.DataFrame(stats_rows) if stats_rows else pd.DataFrame(columns=["match_id", "team_id", "goals_for", "goals_against", *SIDE_STATS])
+    events_df = pd.DataFrame(events) if events else pd.DataFrame(columns=["event_id", "match_id", "team_id", "player", "assist_player", "event_type", "minute"])
     players_df = pd.DataFrame(players).drop_duplicates("player_id") if players else pd.DataFrame(columns=["player_id","player","team_id","position"])
     outputs = {"teams": teams_df, "stadiums": stadiums_df, "matches": matches_df, "fixture_slots": slots_df, "team_match_stats": stats_df, "events": events_df, "players": players_df}
     for name, df in outputs.items():

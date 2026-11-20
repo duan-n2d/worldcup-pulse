@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-
 import pandas as pd
 
 from common import GOLD_DIR, SILVER_DIR, read_parquet, write_parquet
@@ -32,15 +30,6 @@ def _safe_int(value, default: int = 0) -> int:
         return default
 
 
-def _safe_float(value, default: float = 0.0) -> float:
-    try:
-        if pd.isna(value):
-            return default
-        return float(value)
-    except Exception:
-        return default
-
-
 def _norm_status(row: pd.Series) -> str:
     raw = str(row.get("status", "") or "").lower()
     if any(x in raw for x in ["live", "in progress", "playing"]):
@@ -52,9 +41,28 @@ def _norm_status(row: pd.Series) -> str:
     return "scheduled"
 
 
-def _date_from_matchday(matchday: int) -> str:
-    start = datetime(2026, 6, 11)
-    return (start + timedelta(days=max(0, matchday - 1) // 4)).date().isoformat()
+def _optional_float(value) -> float | None:
+    try:
+        if pd.isna(value):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _mean_or_none(df: pd.DataFrame, col: str) -> float | None:
+    if df.empty or col not in df.columns:
+        return None
+    value = pd.to_numeric(df[col], errors="coerce").mean()
+    return None if pd.isna(value) else round(float(value), 1)
+
+
+def _count_events(events: pd.DataFrame, pattern: str) -> int | None:
+    """Count source events whose type matches ``pattern``; None when the source reports none."""
+    if events.empty or "event_type" not in events.columns:
+        return None
+    n = int(events["event_type"].astype(str).str.contains(pattern, case=False, na=False, regex=True).sum())
+    return n or None
 
 
 def _stage_order(stage: str) -> int:
@@ -68,7 +76,7 @@ def _stage_order(stage: str) -> int:
 
 def _empty_outputs() -> dict[str, pd.DataFrame]:
     return {
-        "kpi_summary": pd.DataFrame([{"matches_played": 0, "total_goals": 0, "avg_goals_per_match": 0, "biggest_win": "N/A", "most_offensive_team": "N/A", "most_defensive_team": "N/A", "avg_possession": 0, "cards_per_match": 0, "matches_remaining": 104, "total_yellow_cards": 0, "total_red_cards": 0, "penalties_awarded": 0, "var_goals": 0}]),
+        "kpi_summary": pd.DataFrame([{"matches_played": 0, "total_goals": 0, "avg_goals_per_match": 0, "biggest_win": "N/A", "most_offensive_team": "N/A", "most_defensive_team": "N/A", "avg_possession": None, "cards_per_match": None, "matches_remaining": 104, "total_yellow_cards": None, "total_red_cards": None, "penalties_awarded": None, "var_goals": None}]),
         "goals_by_matchday": pd.DataFrame({"matchday": [1], "goals": [0], "matches": [0]}),
         "goals_by_minute_bucket": pd.DataFrame({"minute_bucket": MINUTE_BUCKETS, "goals": [0] * len(MINUTE_BUCKETS)}),
         "host_cities": pd.DataFrame(),
@@ -79,10 +87,6 @@ def _empty_outputs() -> dict[str, pd.DataFrame]:
         "matches": pd.DataFrame(),
         "group_standings": pd.DataFrame(),
         "match_events": pd.DataFrame(),
-        "substitutions": pd.DataFrame(),
-        "lineups": pd.DataFrame(),
-        "goalkeepers": pd.DataFrame(),
-        "match_player_stats": pd.DataFrame(),
     }
 
 
@@ -93,7 +97,8 @@ def _build_gold_matches(matches: pd.DataFrame, teams: pd.DataFrame, stats: pd.Da
     xg_lu: dict[tuple[str, str], float] = {}
     if not stats.empty and {"match_id", "team_id", "xg"}.issubset(stats.columns):
         for _, r in stats.iterrows():
-            xg_lu[(str(r["match_id"]), str(r["team_id"]))] = round(_safe_float(r.get("xg")), 2)
+            xg = _optional_float(r.get("xg"))
+            xg_lu[(str(r["match_id"]), str(r["team_id"]))] = None if xg is None else round(xg, 2)
     rows = []
     for _, m in matches.iterrows():
         home_id = str(m.get("home_team_id", ""))
@@ -102,14 +107,14 @@ def _build_gold_matches(matches: pd.DataFrame, teams: pd.DataFrame, stats: pd.Da
         away_meta = team_lu.get(away_id, {})
         md = _safe_int(m.get("matchday"), 1)
         kickoff = str(m.get("kickoff_utc", "") or "")
-        match_date = kickoff[:10] if len(kickoff) >= 10 and kickoff[:4].isdigit() else _date_from_matchday(md)
+        match_date = kickoff[:10] if len(kickoff) >= 10 and kickoff[:4].isdigit() else None
         rows.append({
             "match_id": str(m.get("match_id", "")),
             "matchday": md,
             "stage": str(m.get("stage", "Group")),
             "group": home_meta.get("group_name", "Unknown"),
             "match_date": match_date,
-            "kickoff_local": kickoff[11:16] if len(kickoff) >= 16 else "20:00",
+            "kickoff_local": kickoff[11:16] if len(kickoff) >= 16 else None,
             "venue": str(m.get("stadium", "Unknown Stadium")),
             "city": str(m.get("city", "Unknown")),
             "home_team": home_meta.get("team", m.get("home_team_label", home_id)),
@@ -120,7 +125,7 @@ def _build_gold_matches(matches: pd.DataFrame, teams: pd.DataFrame, stats: pd.Da
             "away_score": m.get("away_score"),
             "home_xg": xg_lu.get((str(m.get("match_id", "")), home_id), None),
             "away_xg": xg_lu.get((str(m.get("match_id", "")), away_id), None),
-            "attendance": int(35000 + (sum(ord(c) for c in str(m.get("match_id", ""))) % 50000)),
+            "attendance": _safe_int(m.get("attendance"), None) if pd.notna(m.get("attendance")) else None,
             "status": _norm_status(m),
         })
     return pd.DataFrame(rows).sort_values(["matchday", "match_id"]).reset_index(drop=True)
@@ -134,6 +139,9 @@ def _build_team_tables(teams: pd.DataFrame, stats: pd.DataFrame) -> tuple[pd.Dat
     else:
         tmp = stats.copy()
         tmp["clean_sheet"] = (tmp.get("goals_against", 0).fillna(0).astype(float) == 0).astype(int)
+        for col in ["xg", "shots", "possession_pct", "pass_accuracy_pct", "cards"]:
+            tmp[col] = pd.to_numeric(tmp[col], errors="coerce") if col in tmp.columns else float("nan")
+        # Source-only stats stay null when the API never reported them (min_count=1 keeps an all-null sum null).
         team_agg = tmp.groupby("team_id", as_index=False).agg(
             played=("match_id", "nunique"),
             goals_for=("goals_for", "sum"),
@@ -142,94 +150,85 @@ def _build_team_tables(teams: pd.DataFrame, stats: pd.DataFrame) -> tuple[pd.Dat
             shots=("shots", "mean"),
             possession_pct=("possession_pct", "mean"),
             pass_accuracy_pct=("pass_accuracy_pct", "mean"),
-            cards=("cards", "sum"),
+            cards=("cards", lambda s: s.sum(min_count=1)),
             clean_sheets=("clean_sheet", "sum"),
         )
     team_table = team_names.merge(team_agg, on="team_id", how="left")
-    fill = {"played": 0, "goals_for": 0, "goals_against": 0, "xg": 0, "shots": 0, "possession_pct": 0, "pass_accuracy_pct": 0, "cards": 0, "clean_sheets": 0}
+    fill = {"played": 0, "goals_for": 0, "goals_against": 0, "clean_sheets": 0}
     team_table = team_table.fillna(fill)
     if "group_name" not in team_table.columns:
         team_table["group_name"] = "Unknown"
-    team_table["shots_per_match"] = team_table["shots"].round(1)
-    team_table["setpiece_goals"] = (team_table["goals_for"].astype(float) * 0.22).round(0).astype(int)
+    team_table["shots_per_match"] = pd.to_numeric(team_table["shots"], errors="coerce").round(1)
+    # The source API has no set-piece breakdown, so this stays null rather than being estimated.
+    team_table["setpiece_goals"] = pd.Series([None] * len(team_table), dtype="Int64")
 
     radar = team_table.copy()
     if not radar.empty:
-        radar["attack"] = (radar["goals_for"].astype(float) * 18 + radar["xg"].astype(float) * 10).clip(0, 100).round(1)
+        # Attack/defense are derived from real goal tallies; the other axes are null unless the source reports them.
+        radar["attack"] = (radar["goals_for"].astype(float) * 18).clip(0, 100).round(1)
         radar["defense"] = (100 - radar["goals_against"].astype(float) * 15).clip(20, 100).round(1)
-        radar["possession"] = radar["possession_pct"].astype(float).clip(0, 100).round(1)
-        radar["passing"] = radar["pass_accuracy_pct"].astype(float).clip(0, 100).round(1)
-        radar["discipline"] = (100 - radar["cards"].astype(float) * 4).clip(20, 100).round(1)
+        radar["possession"] = pd.to_numeric(radar["possession_pct"], errors="coerce").clip(0, 100).round(1)
+        radar["passing"] = pd.to_numeric(radar["pass_accuracy_pct"], errors="coerce").clip(0, 100).round(1)
+        radar["discipline"] = (100 - pd.to_numeric(radar["cards"], errors="coerce") * 4).clip(20, 100).round(1)
     team_radar_stats = radar[["team_id", "team", "flag", "fifa_rank", "attack", "defense", "possession", "passing", "discipline"]] if not radar.empty else pd.DataFrame()
     team_key_metrics = team_table[["team_id", "team", "flag", "fifa_rank", "xg", "shots_per_match", "possession_pct", "pass_accuracy_pct", "goals_for", "goals_against", "cards", "clean_sheets", "setpiece_goals"]] if not team_table.empty else pd.DataFrame()
     return team_table, team_radar_stats, team_key_metrics
 
 
 def _build_events(events: pd.DataFrame, teams: pd.DataFrame) -> pd.DataFrame:
+    cols = ["event_id", "match_id", "minute", "half", "event_type", "team_id", "team", "player", "assist_player", "shot_x", "shot_y"]
     if events.empty:
-        return pd.DataFrame(columns=["match_id", "minute", "half", "event_type", "team", "player", "assist_player", "shot_x", "shot_y"])
+        return pd.DataFrame(columns=cols)
     team_lu = teams.set_index("team_id").to_dict("index") if not teams.empty and "team_id" in teams.columns else {}
     rows = []
     for _, ev in events.iterrows():
         team_id = str(ev.get("team_id", ""))
-        minute = _safe_int(ev.get("minute"), 0)
-        base = sum(ord(c) for c in str(ev.get("event_id", "")))
+        minute = _safe_int(ev.get("minute"), None) if pd.notna(ev.get("minute")) else None
         etype = str(ev.get("event_type", "goal") or "goal")
+        player = ev.get("player")
+        assist = ev.get("assist_player")
         rows.append({
             "event_id": str(ev.get("event_id", "")),
             "match_id": str(ev.get("match_id", "")),
             "minute": minute,
-            "half": 1 if minute <= 45 else 2,
+            "half": None if minute is None else (1 if minute <= 45 else 2),
             "event_type": etype,
             "team_id": team_id,
             "team": team_lu.get(team_id, {}).get("team", team_id),
-            "player": str(ev.get("player", f"{team_id} Player")),
-            "assist_player": f"{team_lu.get(team_id, {}).get('team', team_id)} Creator {(base % 7) + 1}",
-            "shot_x": 68 + (base % 24),
-            "shot_y": 18 + (base % 64),
+            "player": player if isinstance(player, str) and player else None,
+            "assist_player": assist if isinstance(assist, str) and assist else None,
+            # The source API has no shot coordinates; kept as null columns for schema stability.
+            "shot_x": None,
+            "shot_y": None,
         })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=cols)
 
 
-def _build_top_players(events_gold: pd.DataFrame, players: pd.DataFrame, teams: pd.DataFrame, team_key_metrics: pd.DataFrame) -> pd.DataFrame:
-    team_lu = teams.set_index("team_id").to_dict("index") if not teams.empty and "team_id" in teams.columns else {}
-    if events_gold.empty:
-        rows = []
-        for _, t in teams.head(12).iterrows():
-            for idx in range(1, 4):
-                rows.append({"player": f"{t.team} Player {idx}", "team_id": t.team_id, "team": t.team, "position": "Forward", "goals": max(0, 4 - idx), "assists": max(0, 3 - idx), "xg": round(2.8 - idx * 0.35, 2)})
-        base = pd.DataFrame(rows)
+def _build_top_players(events_gold: pd.DataFrame, players: pd.DataFrame) -> pd.DataFrame:
+    """Goal (and, when the source names assisters, assist) tallies from real goal events only.
+
+    Ratings, xG, distance, sprint speed, tackles and interceptions are not in the
+    source API, so they are not produced at all.
+    """
+    cols = ["player", "team_id", "team", "position", "goals", "assists"]
+    if events_gold.empty or "player" not in events_gold.columns:
+        return pd.DataFrame(columns=cols)
+    goal_events = events_gold[events_gold["event_type"].astype(str).str.contains("goal", case=False, na=False) & events_gold["player"].notna()]
+    if goal_events.empty:
+        return pd.DataFrame(columns=cols)
+    base = goal_events.groupby(["player", "team_id", "team"], as_index=False).agg(goals=("event_id", "count"))
+    assists_known = "assist_player" in goal_events.columns and goal_events["assist_player"].notna().any()
+    if assists_known:
+        assists = goal_events.dropna(subset=["assist_player"]).groupby(["assist_player", "team_id"], as_index=False).agg(assists=("event_id", "count")).rename(columns={"assist_player": "player"})
+        base = base.merge(assists, on=["player", "team_id"], how="outer")
+        base["team"] = base["team"].fillna(base["team_id"])
+        base["goals"] = base["goals"].fillna(0).astype(int)
+        base["assists"] = base["assists"].fillna(0).astype(int)
     else:
-        goals = events_gold[events_gold["event_type"].astype(str).str.contains("goal", case=False, na=False)].groupby(["player", "team_id", "team"], as_index=False).agg(goals=("event_id", "count"))
-        base = goals
-        base["assists"] = (base["goals"].astype(float) * 0.45).round(0).astype(int)
-        base["xg"] = (base["goals"].astype(float) * 0.72 + 0.35).round(2)
-        base["position"] = "Forward"
-    if base.empty:
-        return pd.DataFrame(columns=["player", "team_id", "team", "position", "goals", "assists", "xg", "rating", "distance_km", "sprint_speed_kmh", "pass_accuracy_pct", "tackles", "interceptions"])
-    rows = []
-    metric_lu = team_key_metrics.set_index("team_id").to_dict("index") if not team_key_metrics.empty and "team_id" in team_key_metrics.columns else {}
-    for _, r in base.iterrows():
-        tid = str(r.get("team_id", ""))
-        seed = sum(ord(c) for c in str(r.get("player", "")))
-        team_name = r.get("team") or team_lu.get(tid, {}).get("team", tid)
-        pass_acc = metric_lu.get(tid, {}).get("pass_accuracy_pct", 78 + seed % 14)
-        rows.append({
-            "player": r.get("player"),
-            "team_id": tid,
-            "team": team_name,
-            "position": r.get("position", "Forward"),
-            "goals": _safe_int(r.get("goals")),
-            "assists": _safe_int(r.get("assists")),
-            "xg": round(_safe_float(r.get("xg")), 2),
-            "rating": round(6.2 + min(2.7, _safe_int(r.get("goals")) * 0.35 + _safe_int(r.get("assists")) * 0.22 + (seed % 9) / 20), 2),
-            "distance_km": round(8.5 + (seed % 32) / 10, 1),
-            "sprint_speed_kmh": round(29 + (seed % 48) / 10, 1),
-            "pass_accuracy_pct": round(_safe_float(pass_acc), 1),
-            "tackles": int(seed % 9),
-            "interceptions": int((seed // 3) % 8),
-        })
-    return pd.DataFrame(rows).sort_values(["goals", "xg", "assists"], ascending=False).reset_index(drop=True)
+        base["assists"] = pd.Series([None] * len(base), dtype="Int64")
+    position_lu = players.drop_duplicates(["player", "team_id"]).set_index(["player", "team_id"])["position"].to_dict() if not players.empty and {"player", "team_id", "position"}.issubset(players.columns) else {}
+    base["position"] = [position_lu.get((p, t)) for p, t in zip(base["player"], base["team_id"])]
+    return base[cols].sort_values(["goals", "assists"], ascending=False, na_position="last").reset_index(drop=True)
 
 
 def _build_group_standings(teams: pd.DataFrame, stats: pd.DataFrame) -> pd.DataFrame:
@@ -267,42 +266,6 @@ def _build_group_standings(teams: pd.DataFrame, stats: pd.DataFrame) -> pd.DataF
     return df
 
 
-def _build_subs_lineups_goalkeepers_match_player_stats(matches_gold: pd.DataFrame, teams: pd.DataFrame, top_players: pd.DataFrame, team_key_metrics: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    subs_rows = []
-    lineup_rows = []
-    mps_rows = []
-    if not matches_gold.empty and not teams.empty:
-        team_id_by_name = teams.set_index("team")["team_id"].to_dict() if "team" in teams.columns else {}
-        for _, m in matches_gold.iterrows():
-            for team_col in ["home_team", "away_team"]:
-                team = m.get(team_col)
-                if not team or str(team).startswith(("Winner", "Runner", "3rd", "Loser")):
-                    continue
-                tid = team_id_by_name.get(team, str(team)[:3].upper())
-                for n in range(1, 12):
-                    pos = ["GK", "DF", "DF", "DF", "DF", "MF", "MF", "MF", "FW", "FW", "FW"][n - 1]
-                    player = f"{team} {pos} {n}"
-                    lineup_rows.append({"match_id": m.get("match_id"), "team": team, "player": player, "position": pos, "shirt_number": n, "is_starting": True})
-                    seed = sum(ord(c) for c in f"{m.get('match_id')}{player}")
-                    mps_rows.append({"match_id": m.get("match_id"), "player": player, "team": team, "stage": m.get("stage"), "matchday": m.get("matchday"), "minutes_played": 90 if n <= 8 else 68 + seed % 22, "goals": 1 if (n >= 9 and seed % 5 == 0) else 0, "assists": 1 if (n >= 6 and seed % 7 == 0) else 0, "rating": round(6.0 + (seed % 28) / 10, 2), "distance_km": round(7.5 + (seed % 45) / 10, 1), "sprint_speed_kmh": round(27.5 + (seed % 60) / 10, 1), "pass_accuracy_pct": round(72 + (seed % 24), 1), "tackles": seed % 7, "interceptions": (seed // 4) % 7})
-                for minute, idx in [(62, 12), (76, 13), (84, 14)]:
-                    subs_rows.append({"match_id": m.get("match_id"), "team": team, "minute": minute, "player_off": f"{team} Player {idx-5}", "player_on": f"{team} Player {idx}"})
-    subs = pd.DataFrame(subs_rows)
-    lineups = pd.DataFrame(lineup_rows)
-    mps = pd.DataFrame(mps_rows)
-
-    gk_rows = []
-    for _, t in teams.iterrows():
-        tid = t.get("team_id")
-        km = team_key_metrics[team_key_metrics["team_id"] == tid].iloc[0].to_dict() if not team_key_metrics.empty and (team_key_metrics["team_id"] == tid).any() else {}
-        seed = sum(ord(c) for c in str(t.get("team", "")))
-        conceded = _safe_int(km.get("goals_against"), seed % 5)
-        saves = 8 + seed % 18
-        gk_rows.append({"player": f"{t.get('team')} Goalkeeper 1", "team": t.get("team"), "saves": saves, "save_pct": round(100 * saves / max(1, saves + conceded), 1), "penalties_saved": seed % 2, "clean_sheets": _safe_int(km.get("clean_sheets"), 0), "goals_conceded": conceded})
-    goalkeepers = pd.DataFrame(gk_rows)
-    return subs, lineups, goalkeepers, mps
-
-
 def build_gold() -> dict[str, pd.DataFrame]:
     teams = read_parquet(SILVER_DIR / "teams.parquet")
     matches = read_parquet(SILVER_DIR / "matches.parquet")
@@ -329,6 +292,8 @@ def build_gold() -> dict[str, pd.DataFrame]:
         biggest_win = f"{r['home_team']} {int(r['home_score'])}-{int(r['away_score'])} {r['away_team']}"
 
     team_table, team_radar_stats, team_key_metrics = _build_team_tables(teams, stats)
+    match_events = _build_events(events, teams)
+    total_cards = _optional_float(pd.to_numeric(stats["cards"], errors="coerce").sum(min_count=1)) if not stats.empty and "cards" in stats.columns else None
     most_offensive = team_table.sort_values("goals_for", ascending=False).iloc[0]["team"] if not team_table.empty else "N/A"
     most_defensive = team_table.sort_values("goals_against", ascending=True).iloc[0]["team"] if not team_table.empty else "N/A"
     kpi_summary = pd.DataFrame([{
@@ -338,36 +303,37 @@ def build_gold() -> dict[str, pd.DataFrame]:
         "biggest_win": biggest_win,
         "most_offensive_team": most_offensive,
         "most_defensive_team": most_defensive,
-        "avg_possession": round(float(stats["possession_pct"].mean()), 1) if not stats.empty and "possession_pct" in stats.columns else 0,
-        "cards_per_match": round(float(stats["cards"].sum()) / match_count, 2) if match_count and not stats.empty and "cards" in stats.columns else 0,
+        "avg_possession": _mean_or_none(stats, "possession_pct"),
+        "cards_per_match": round(total_cards / match_count, 2) if match_count and total_cards is not None else None,
         "matches_remaining": max(0, len(matches_gold) - match_count),
-        "total_yellow_cards": int(stats["cards"].fillna(0).sum()) if not stats.empty and "cards" in stats.columns else 0,
-        "total_red_cards": max(0, int((stats["cards"].fillna(0).sum() if not stats.empty and "cards" in stats.columns else 0) * 0.08)),
-        "penalties_awarded": max(0, int(total_goals * 0.12)),
-        "var_goals": max(0, int(total_goals * 0.08)),
+        # Card / penalty / VAR counts only come from source events; null when the API does not report them.
+        "total_yellow_cards": _count_events(match_events, "yellow"),
+        "total_red_cards": _count_events(match_events, "red"),
+        "penalties_awarded": _count_events(match_events, "penalty"),
+        "var_goals": _count_events(match_events, "var"),
     }])
 
     goals_by_matchday = played.assign(goals=played["home_score"].fillna(0) + played["away_score"].fillna(0)).groupby("matchday", as_index=False).agg(goals=("goals", "sum"), matches=("match_id", "count")) if not played.empty else pd.DataFrame({"matchday": [1], "goals": [0], "matches": [0]})
-    match_events = _build_events(events, teams)
-    if match_events.empty:
+    if match_events.empty or match_events["minute"].notna().sum() == 0:
         goals_by_minute = pd.DataFrame({"minute_bucket": MINUTE_BUCKETS, "goals": [0] * len(MINUTE_BUCKETS)})
     else:
-        ev = match_events[match_events["event_type"].astype(str).str.contains("goal", case=False, na=False)].copy()
-        ev["minute_bucket"] = ev["minute"].fillna(0).astype(int).map(_bucket)
+        ev = match_events[match_events["event_type"].astype(str).str.contains("goal", case=False, na=False) & match_events["minute"].notna()].copy()
+        ev["minute_bucket"] = ev["minute"].astype(int).map(_bucket)
         goals_by_minute = ev.groupby("minute_bucket", as_index=False).agg(goals=("event_id", "count"))
         goals_by_minute = pd.DataFrame({"minute_bucket": MINUTE_BUCKETS}).merge(goals_by_minute, on="minute_bucket", how="left").fillna({"goals": 0})
 
-    if not stadiums.empty and not matches.empty:
+    if not matches.empty:
         host_cities = matches.groupby(["city", "stadium"], as_index=False).agg(matches=("match_id", "count"))
-        host_cities = host_cities.merge(stadiums[["stadium", "country", "lat", "lon"]], on="stadium", how="left") if "stadium" in stadiums.columns else host_cities
-        host_cities["lat"] = host_cities.get("lat", pd.Series([None] * len(host_cities))).fillna(39.5)
-        host_cities["lon"] = host_cities.get("lon", pd.Series([None] * len(host_cities))).fillna(-98.3)
+        host_cities = host_cities.merge(stadiums[["stadium", "country", "lat", "lon"]], on="stadium", how="left") if not stadiums.empty and "stadium" in stadiums.columns else host_cities
+        # Coordinates stay null when the source has none for a stadium (no placeholder location).
+        for col in ["country", "lat", "lon"]:
+            if col not in host_cities.columns:
+                host_cities[col] = None
     else:
         host_cities = pd.DataFrame()
 
-    top_players = _build_top_players(match_events, players, teams, team_key_metrics)
+    top_players = _build_top_players(match_events, players)
     group_standings = _build_group_standings(teams, stats)
-    substitutions, lineups, goalkeepers, match_player_stats = _build_subs_lineups_goalkeepers_match_player_stats(matches_gold, teams, top_players, team_key_metrics)
 
     outputs = {
         "kpi_summary": kpi_summary,
@@ -381,10 +347,6 @@ def build_gold() -> dict[str, pd.DataFrame]:
         "matches": matches_gold,
         "group_standings": group_standings,
         "match_events": match_events,
-        "substitutions": substitutions,
-        "lineups": lineups,
-        "goalkeepers": goalkeepers,
-        "match_player_stats": match_player_stats,
     }
     for name, df in outputs.items():
         write_parquet(df, GOLD_DIR / f"{name}.parquet")

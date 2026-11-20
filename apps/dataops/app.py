@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 
 import duckdb
 import pandas as pd
 import streamlit as st
 
-from data_access import download_gold_path, load_gold_table, load_log_table
+from data_access import begin_mock_tracking, download_gold_path, load_gold_table, load_log_table, render_mock_banner
 
 st.set_page_config(page_title="WorldCup Pulse DataOps", page_icon="⚙️", layout="wide", initial_sidebar_state="expanded")
 
@@ -48,10 +47,6 @@ GOLD_TABLES = [
     "matches.parquet",
     "group_standings.parquet",
     "match_events.parquet",
-    "substitutions.parquet",
-    "lineups.parquet",
-    "goalkeepers.parquet",
-    "match_player_stats.parquet",
 ]
 
 
@@ -65,14 +60,8 @@ def status_badge(status: str) -> str:
 
 
 def next_run_text() -> str:
-    now = datetime.now(timezone.utc)
-    minute = ((now.minute // 5) + 1) * 5
-    nxt = now.replace(second=0, microsecond=0)
-    if minute >= 60:
-        nxt = nxt.replace(minute=0) + timedelta(hours=1)
-    else:
-        nxt = nxt.replace(minute=minute)
-    return nxt.strftime("%H:%M UTC")
+    # The scheduled refresh is disabled (tournament over); runs are manual or token-authenticated Worker dispatches.
+    return "Manual only"
 
 
 def card(label: str, value: str, icon: str):
@@ -96,7 +85,7 @@ def heartbeat():
         html = view[[c for c in ["run_id","started_at","finished_at","status_badge","rows_bronze","rows_silver","rows_gold","error_message"] if c in view.columns]].to_html(escape=False, index=False)
         st.markdown(html, unsafe_allow_html=True)
     else:
-        st.info("No pipeline runs available yet. Mock fallback is being used.")
+        st.info("No pipeline runs available yet.")
 
 
 def quality_tabs():
@@ -109,14 +98,18 @@ def quality_tabs():
             if df.empty:
                 st.warning("No checks found for this layer.")
                 continue
-            pass_count = int(df["status"].astype(str).str.lower().eq("pass").sum())
-            fail_count = int(len(df) - pass_count)
-            c1, c2 = st.columns(2)
+            status = df["status"].astype(str).str.lower()
+            pass_count = int(status.eq("pass").sum())
+            warn_count = int(status.eq("warn").sum())
+            fail_count = int(len(df) - pass_count - warn_count)
+            c1, c2, c3 = st.columns(3)
             with c1: card("Checks Passed", str(pass_count), "✅")
-            with c2: card("Checks Failed", str(fail_count), "🚨")
+            with c2: card("Warnings", str(warn_count), "⚠️")
+            with c3: card("Checks Failed", str(fail_count), "🚨")
             for _, row in df.iterrows():
-                passed = str(row.get("status", "")).lower() == "pass"
-                with st.status(f"{row.get('layer','')} · {row.get('table','')} · {row.get('check_name','')}", state="complete" if passed else "error"):
+                row_status = str(row.get("status", "")).lower()
+                prefix = "⚠️ " if row_status == "warn" else ""
+                with st.status(f"{prefix}{row.get('layer','')} · {row.get('table','')} · {row.get('check_name','')}", state="error" if row_status == "fail" else "complete"):
                     st.write(row.get("message", ""))
 
 
@@ -144,12 +137,16 @@ def duckdb_console():
 st.sidebar.markdown("### WorldCup Pulse")
 st.sidebar.radio("Navigation", ["⚙️ Data Ops Monitor"], label_visibility="collapsed")
 st.sidebar.markdown('<div class="sidebar-logo"><div style="font-size:2.2rem">🛠️⚽</div><b>DataOps Console</b><br><span style="color:#9DB4C8;font-size:.8rem">Pipeline · Quality · Warehouse</span></div>', unsafe_allow_html=True)
-st.sidebar.caption("Cloudflare cron → GitHub Actions → HF Dataset")
+st.sidebar.caption("Manual / Worker dispatch → GitHub Actions → HF Dataset")
 
-st.markdown('<div class="hero"><h1>⚙️ WorldCup Pulse Data Ops Monitor</h1><p>Operational view for near-real-time ETL, lakehouse quality checks, and DuckDB gold marts.</p></div>', unsafe_allow_html=True)
-heartbeat()
-st.markdown("---")
-st.markdown("### Data Quality Tabs")
-quality_tabs()
-st.markdown("---")
-duckdb_console()
+st.markdown('<div class="hero"><h1>⚙️ WorldCup Pulse Data Ops Monitor</h1><p>Operational view for the ETL run log, lakehouse quality checks, and DuckDB gold marts.</p></div>', unsafe_allow_html=True)
+mock_banner = begin_mock_tracking()
+try:
+    heartbeat()
+    st.markdown("---")
+    st.markdown("### Data Quality Tabs")
+    quality_tabs()
+    st.markdown("---")
+    duckdb_console()
+finally:
+    render_mock_banner(mock_banner)

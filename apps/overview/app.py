@@ -9,7 +9,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-from data_access import load_gold_table
+from data_access import begin_mock_tracking, load_gold_table, render_mock_banner
 
 st.set_page_config(page_title="WorldCup Pulse Overview", page_icon="⚽", layout="wide", initial_sidebar_state="expanded")
 
@@ -29,6 +29,7 @@ st.set_page_config(page_title="WorldCup Pulse Overview", page_icon="⚽", layout
 #       match_id, matchday, stage, group, match_date, kickoff_local, venue, city,
 #       home_team, home_flag, away_team, away_flag, home_score, away_score,
 #       home_xg, away_xg, attendance, status ("completed"|"live"|"scheduled")
+#       (xg/attendance/date are null when the source API does not provide them)
 #
 #   group_standings.parquet
 #       group, team, flag, played, won, drawn, lost, goals_for, goals_against,
@@ -42,26 +43,17 @@ st.set_page_config(page_title="WorldCup Pulse Overview", page_icon="⚽", layout
 #       NOTE: "team" on a goal event = the team CREDITED with the goal
 #       (an own goal is credited to the attacking/benefiting side).
 #
-#   substitutions.parquet
-#       match_id, team, minute, player_off, player_on
+# The pipeline never estimates stats the source API does not carry. xG, shots,
+# possession, pass accuracy, cards, set-piece goals, assists, positions, shot
+# coordinates and attendance are null unless the API reports them, and every
+# view below hides or labels a stat that has no values. Lineups, substitutions,
+# goalkeeper stats and per-player ratings / physical stats are not produced.
 #
-#   lineups.parquet
-#       match_id, team, player, position, shirt_number, is_starting (bool)
-#
-#   goalkeepers.parquet
-#       player, team, saves, save_pct, penalties_saved, clean_sheets, goals_conceded
-#
-#   match_player_stats.parquet  (granular per-player-per-match form data)
-#       match_id, player, team, stage, matchday, minutes_played, goals, assists,
-#       rating, distance_km, sprint_speed_kmh, pass_accuracy_pct, tackles, interceptions
-#
-# OPTIONAL new columns on EXISTING tables (all read with safe .get(), so missing
-# columns simply show "N/A" instead of breaking anything):
+# OPTIONAL columns on EXISTING tables (missing or null values show "N/A"):
 #   kpi_summary.parquet      + matches_remaining, total_yellow_cards, total_red_cards,
 #                              penalties_awarded, var_goals
 #   team_key_metrics.parquet + goals_against, clean_sheets, setpiece_goals
-#   top_players.parquet      + position, rating, distance_km, sprint_speed_kmh,
-#                              pass_accuracy_pct, tackles, interceptions
+#   top_players.parquet      + position, assists
 # ---------------------------------------------------------------------------
 
 CSS = """
@@ -184,6 +176,32 @@ def insight(title: str, body: str):
     st.markdown(f'<div class="insight-card"><b>{title}</b><br>{body}</div>', unsafe_allow_html=True)
 
 
+def unavailable_notice(what: str):
+    st.markdown(
+        f'<div class="insight-card">ℹ️ <b>Not available</b> — {what} is not provided by the source API, '
+        f'so it is not shown (WorldCup Pulse does not estimate missing stats).</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def has_values(df: pd.DataFrame, *cols: str) -> bool:
+    """True when every column exists and has at least one non-null value."""
+    return df is not None and not df.empty and all(c in df.columns and df[c].notna().any() for c in cols)
+
+
+def fmt(value, suffix: str = "") -> str:
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return "N/A"
+    return f"{value}{suffix}"
+
+
+def progress_or_na(label: str, value, max_value: float, suffix: str = "", digits: int = 1):
+    if value is None or pd.isna(value):
+        st.markdown(f'<div class="metric-name">{label}</div><div class="metric-small">N/A</div><div class="sub" style="color:#9DB4C8;font-size:.72rem;">not in source API</div>', unsafe_allow_html=True)
+        return
+    progress(label, round(float(value), digits), max_value, suffix)
+
+
 def missing_data_notice(table: str, what_it_unlocks: str = ""):
     st.markdown(
         f'<div class="insight-card">⏳ <b>Waiting on data</b> — '
@@ -288,7 +306,7 @@ def sidebar() -> str:
 # ---------------------------------------------------------------------------
 
 def overview():
-    hero("⚽ WorldCup Pulse Lakehouse", "Near-real-time football analytics powered by Cloudflare cron, GitHub Actions, Hugging Face Dataset storage, DuckDB and Streamlit.")
+    hero("⚽ WorldCup Pulse Lakehouse", "Football analytics from a Bronze/Silver/Gold lakehouse built by GitHub Actions, stored in a Hugging Face Dataset, and served with DuckDB and Streamlit.")
 
     kpi = load_gold_table("kpi_summary.parquet").iloc[0].to_dict()
     cols = st.columns(8)
@@ -299,8 +317,8 @@ def overview():
         ("Biggest Win", kpi.get("biggest_win", "N/A"), "🔥"),
         ("Most Offensive", kpi.get("most_offensive_team", "N/A"), "⚡"),
         ("Most Defensive", kpi.get("most_defensive_team", "N/A"), "🛡️"),
-        ("Avg Possession", f"{kpi.get('avg_possession', 0)}%", "🎛️"),
-        ("Cards/Match", kpi.get("cards_per_match", 0), "🟨"),
+        ("Avg Possession", fmt(kpi.get("avg_possession"), "%"), "🎛️"),
+        ("Cards/Match", fmt(kpi.get("cards_per_match")), "🟨"),
     ]
     for c, item in zip(cols, data):
         with c:
@@ -309,15 +327,15 @@ def overview():
     st.markdown("#### Discipline & Set Pieces")
     d_cols = st.columns(5)
     d_data = [
-        ("Matches Remaining", kpi.get("matches_remaining", "N/A"), "⏳"),
-        ("Yellow Cards", kpi.get("total_yellow_cards", "N/A"), "🟨"),
-        ("Red Cards", kpi.get("total_red_cards", "N/A"), "🟥"),
-        ("Penalties Awarded", kpi.get("penalties_awarded", "N/A"), "🎯"),
-        ("VAR Goals", kpi.get("var_goals", "N/A"), "📺"),
+        ("Matches Remaining", fmt(kpi.get("matches_remaining")), "⏳"),
+        ("Yellow Cards", fmt(kpi.get("total_yellow_cards")), "🟨"),
+        ("Red Cards", fmt(kpi.get("total_red_cards")), "🟥"),
+        ("Penalties Awarded", fmt(kpi.get("penalties_awarded")), "🎯"),
+        ("VAR Goals", fmt(kpi.get("var_goals")), "📺"),
     ]
     for c, item in zip(d_cols, d_data):
         with c:
-            card(item[0], str(item[1]), item[2], sub="if tracked by ETL")
+            card(item[0], str(item[1]), item[2], sub="N/A = not in source API")
 
     metrics = load_gold_table("team_key_metrics.parquet")
     minute = load_gold_table("goals_by_minute_bucket.parquet")
@@ -326,25 +344,29 @@ def overview():
     st.markdown("#### 🔍 Tournament Storylines")
     ic1, ic2, ic3, ic4 = st.columns(4)
     with ic1:
-        if {"goals_for", "xg", "team"}.issubset(metrics.columns):
-            m2 = metrics.copy()
+        if has_values(metrics, "goals_for", "xg", "team"):
+            m2 = metrics.dropna(subset=["xg"]).copy()
             m2["finishing_delta"] = m2["goals_for"] - m2["xg"]
             top = m2.sort_values("finishing_delta", ascending=False).iloc[0]
             insight("Most Clinical", f"{top.team} have scored {top.finishing_delta:+.1f} goals above their xG — ruthless in front of net.")
     with ic2:
-        if {"cards", "team"}.issubset(metrics.columns):
-            calm = metrics.sort_values("cards").iloc[0]
+        if has_values(metrics, "cards", "team"):
+            calm = metrics.dropna(subset=["cards"]).sort_values("cards").iloc[0]
             insight("Most Disciplined", f"{calm.team} average just {calm.cards} cards per match, the cleanest record so far.")
     with ic3:
         if not minute.empty and {"minute_bucket", "goals"}.issubset(minute.columns):
             peak = minute.sort_values("goals", ascending=False).iloc[0]
             insight("Peak Drama Window", f"The <b>{peak.minute_bucket}</b> minute bucket has the most goals ({peak.goals}) — that's when matches tend to swing.")
     with ic4:
-        if players_ok and {"goals", "assists", "player"}.issubset(players.columns):
+        if players_ok and has_values(players, "goals", "player"):
             p2 = players.copy()
-            p2["impact"] = p2["goals"].fillna(0) + p2["assists"].fillna(0)
-            star = p2.sort_values("impact", ascending=False).iloc[0]
-            insight("Golden Boot Pace", f"{star.player} leads all contributors with {int(star.goals)} goals and {int(star.assists)} assists.")
+            if has_values(p2, "assists"):
+                p2["impact"] = p2["goals"].fillna(0) + p2["assists"].fillna(0)
+                star = p2.sort_values("impact", ascending=False).iloc[0]
+                insight("Golden Boot Pace", f"{star.player} leads all contributors with {int(star.goals)} goals and {int(star.assists)} assists.")
+            else:
+                star = p2.sort_values("goals", ascending=False).iloc[0]
+                insight("Golden Boot Pace", f"{star.player} leads the scoring charts with {int(star.goals)} goals.")
 
     st.markdown("#### Attacking vs Defensive Trend")
     avg_now = kpi.get("avg_goals_per_match")
@@ -380,9 +402,13 @@ def overview():
     left2, right2 = st.columns([1.25, .75])
     with left2:
         cities = load_gold_table("host_cities.parquet")
-        fig = px.scatter_mapbox(cities, lat="lat", lon="lon", size="matches", color="country", hover_name="city", hover_data=["stadium", "matches"], zoom=2.1, height=430, title="Host City Map — North America")
-        fig.update_layout(mapbox_style="carto-darkmatter", mapbox=dict(center={"lat": 38, "lon": -96}), margin=dict(l=0, r=0, t=45, b=0))
-        st.plotly_chart(fig_layout(fig), use_container_width=True)
+        mapped = cities.dropna(subset=["lat", "lon"]) if {"lat", "lon"}.issubset(cities.columns) else pd.DataFrame()
+        if mapped.empty:
+            unavailable_notice("Stadium coordinates")
+        else:
+            fig = px.scatter_mapbox(mapped, lat="lat", lon="lon", size="matches", color="country", hover_name="city", hover_data=["stadium", "matches"], zoom=2.1, height=430, title="Host City Map — North America")
+            fig.update_layout(mapbox_style="carto-darkmatter", mapbox=dict(center={"lat": 38, "lon": -96}), margin=dict(l=0, r=0, t=45, b=0))
+            st.plotly_chart(fig_layout(fig), use_container_width=True)
     with right2:
         team = metrics.sort_values("goals_for", ascending=True).tail(10)
         fig = px.bar(team, x="goals_for", y="team", orientation="h", title="Top Offensive Teams", color="goals_for", color_continuous_scale=[INDIGO, CYAN, NEON])
@@ -391,14 +417,22 @@ def overview():
     st.markdown("#### Performance Analytics")
     a1, a2 = st.columns(2)
     with a1:
-        m3 = metrics.copy()
-        m3["finishing_delta"] = m3["goals_for"] - m3["xg"]
-        m3 = m3.sort_values("finishing_delta")
-        fig = px.bar(m3, x="finishing_delta", y="team", orientation="h", title="Clinical Finishing — Goals Scored vs Expected (xG)", color="finishing_delta", color_continuous_scale=[PINK, INDIGO, NEON])
-        fig.add_vline(x=0, line_dash="dot", line_color="#9DB4C8")
-        st.plotly_chart(fig_layout(fig), use_container_width=True)
+        if has_values(metrics, "xg"):
+            m3 = metrics.dropna(subset=["xg"]).copy()
+            m3["finishing_delta"] = m3["goals_for"] - m3["xg"]
+            m3 = m3.sort_values("finishing_delta")
+            fig = px.bar(m3, x="finishing_delta", y="team", orientation="h", title="Clinical Finishing — Goals Scored vs Expected (xG)", color="finishing_delta", color_continuous_scale=[PINK, INDIGO, NEON])
+            fig.add_vline(x=0, line_dash="dot", line_color="#9DB4C8")
+            st.plotly_chart(fig_layout(fig), use_container_width=True)
+        else:
+            unavailable_notice("Expected goals (xG)")
     with a2:
-        fig = px.scatter(metrics, x="fifa_rank", y="goals_for", size="xg", color="possession_pct", hover_name="team", title="Giant Killers — FIFA Rank vs Goals Scored", color_continuous_scale=[INDIGO, CYAN, NEON])
+        scatter_kwargs = {}
+        if has_values(metrics, "xg"):
+            scatter_kwargs["size"] = metrics["xg"].fillna(0)
+        if has_values(metrics, "possession_pct"):
+            scatter_kwargs["color"] = "possession_pct"
+        fig = px.scatter(metrics, x="fifa_rank", y="goals_for", hover_name="team", title="Giant Killers — FIFA Rank vs Goals Scored", color_continuous_scale=[INDIGO, CYAN, NEON], **scatter_kwargs)
         fig.update_xaxes(autorange="reversed", title="FIFA Rank (lower = stronger)")
         fig.update_yaxes(title="Goals For")
         st.plotly_chart(fig_layout(fig), use_container_width=True)
@@ -412,12 +446,10 @@ def match_center():
     hero("🏟️ Match Center", "Live scores, fixtures, match-level breakdowns, and tournament-wide in-game patterns.")
     df, ok = safe_load("matches.parquet")
     if not ok:
-        missing_data_notice("matches.parquet", "Once populated: live scores, fixtures, goal timelines, shot maps, and substitution tracking.")
+        missing_data_notice("matches.parquet", "Once populated: scores, fixtures, and goal timelines.")
         return
 
     events_df, events_ok = safe_load("match_events.parquet")
-    subs_df, subs_ok = safe_load("substitutions.parquet")
-    lineups_df, lineups_ok = safe_load("lineups.parquet")
 
     tab_fixtures, tab_detail, tab_patterns = st.tabs(["📋 Fixtures & Results", "🔍 Match Detail", "📐 Tournament Patterns"])
 
@@ -454,11 +486,13 @@ def match_center():
                     avg_goals = completed["total_goals"].mean()
                     insight("Avg Goals (filtered)", f"{avg_goals:.2f} goals per match across {len(completed)} completed fixtures shown.")
                 with ic3:
-                    if {"home_xg", "away_xg"}.issubset(completed.columns):
+                    if has_values(completed, "home_xg", "away_xg"):
                         completed["xg_total"] = completed["home_xg"] + completed["away_xg"]
                         completed["upset_index"] = (completed["total_goals"] - completed["xg_total"]).abs()
-                        upset = completed.sort_values("upset_index", ascending=False).iloc[0]
+                        upset = completed.dropna(subset=["upset_index"]).sort_values("upset_index", ascending=False).iloc[0]
                         insight("Biggest xG Surprise", f"{upset.home_team} vs {upset.away_team} deviated most from the expected-goals script.")
+                    else:
+                        unavailable_notice("Expected goals (xG)")
 
         st.markdown("#### Fixtures & Results")
         if "match_date" in view.columns:
@@ -508,33 +542,7 @@ def match_center():
                         shot_fig.update_layout(height=320, title="Goal Locations")
                         st.plotly_chart(fig_layout(shot_fig), use_container_width=True)
 
-            if subs_ok and "match_id" in subs_df.columns:
-                match_subs = subs_df[subs_df["match_id"] == match_id]
-                if not match_subs.empty:
-                    st.markdown("##### Substitutions")
-                    for _, srow in match_subs.sort_values("minute").iterrows():
-                        st.markdown(f"`{int(srow.minute)}'` **{srow.team}** — {srow.get('player_off', '?')} ➜ {srow.get('player_on', '?')}")
-            elif not subs_ok:
-                missing_data_notice("substitutions.parquet", "Once populated: substitution timing and personnel for this match.")
-
-            if lineups_ok and "match_id" in lineups_df.columns:
-                match_lineups = lineups_df[lineups_df["match_id"] == match_id]
-                if not match_lineups.empty:
-                    st.markdown("##### Starting XI")
-                    starters = match_lineups[match_lineups["is_starting"] == True] if "is_starting" in match_lineups.columns else match_lineups
-                    show_cols = [c for c in ["shirt_number", "player", "position"] if c in starters.columns]
-                    l1, l2 = st.columns(2)
-                    home_name, away_name = match_row.get("home_team"), match_row.get("away_team")
-                    with l1:
-                        st.markdown(f"**{home_name}**")
-                        hxi = starters[starters["team"] == home_name][show_cols] if "team" in starters.columns and show_cols else pd.DataFrame()
-                        st.dataframe(hxi, use_container_width=True, hide_index=True)
-                    with l2:
-                        st.markdown(f"**{away_name}**")
-                        axi = starters[starters["team"] == away_name][show_cols] if "team" in starters.columns and show_cols else pd.DataFrame()
-                        st.dataframe(axi, use_container_width=True, hide_index=True)
-            elif not lineups_ok:
-                missing_data_notice("lineups.parquet", "Once populated: starting XI and bench for each match.")
+            unavailable_notice("Lineups and substitutions")
 
     # --- Tournament Patterns --------------------------------------------------
     with tab_patterns:
@@ -645,9 +653,11 @@ def team_intelligence():
 
     c1, c2, c3 = st.columns([1, 1, 1.15])
     with c1:
-        cats = ["Attack", "Defense", "Possession", "Passing", "Discipline"]
-        vals = [r.attack, r.defense, r.possession, r.passing, r.discipline]
-        avg_r = radar[["attack", "defense", "possession", "passing", "discipline"]].mean()
+        # Only axes with source-backed values are drawn; null axes are left off rather than estimated.
+        axes = [(label, col) for label, col in [("Attack", "attack"), ("Defense", "defense"), ("Possession", "possession"), ("Passing", "passing"), ("Discipline", "discipline")] if has_values(radar, col)]
+        cats = [label for label, _ in axes]
+        vals = [float(r[col]) if pd.notna(r[col]) else 0.0 for _, col in axes]
+        avg_r = radar[[col for _, col in axes]].mean()
         fig = go.Figure()
         fig.add_trace(go.Scatterpolar(r=avg_r.tolist() + [avg_r.tolist()[0]], theta=cats + [cats[0]], line=dict(color=CYAN, width=2, dash="dot"), fillcolor="rgba(0,212,255,.06)", fill="toself", name="Tournament Avg"))
         fig.add_trace(go.Scatterpolar(r=vals + [vals[0]], theta=cats + [cats[0]], fill="toself", line=dict(color=NEON, width=3), fillcolor="rgba(0,245,160,.18)", name=selected))
@@ -655,18 +665,23 @@ def team_intelligence():
         st.plotly_chart(fig_layout(fig), use_container_width=True)
     with c2:
         st.markdown("#### Key Performance Metrics")
-        progress("Expected Goals", round(float(m.xg), 2), 3, " xG")
-        progress("Shots / Match", round(float(m.shots_per_match), 1), 20, "")
-        progress("Possession", round(float(m.possession_pct), 1), 100, "%")
-        progress("Pass Accuracy", round(float(m.pass_accuracy_pct), 1), 100, "%")
-        progress("Discipline Index", max(0, round(100 - float(m.cards) * 4, 1)), 100, "%")
+        progress_or_na("Expected Goals", m.get("xg"), 3, " xG", digits=2)
+        progress_or_na("Shots / Match", m.get("shots_per_match"), 20, "")
+        progress_or_na("Possession", m.get("possession_pct"), 100, "%")
+        progress_or_na("Pass Accuracy", m.get("pass_accuracy_pct"), 100, "%")
+        cards = m.get("cards")
+        progress_or_na("Discipline Index", None if cards is None or pd.isna(cards) else max(0, 100 - float(cards) * 4), 100, "%")
     with c3:
         st.markdown("#### Player Contribution")
-        p = players[players["team"].eq(selected)].sort_values(["goals", "xg"], ascending=False).head(5).copy()
-        if p.empty:
-            p = players.sort_values(["goals", "xg"], ascending=False).head(5).copy()
-        p["impact"] = (p["goals"].fillna(0) * 20 + p["assists"].fillna(0) * 12 + p["xg"].fillna(0) * 10).clip(0, 100)
-        st.dataframe(p[["player", "goals", "assists", "xg", "impact"]], use_container_width=True, hide_index=True, column_config={"impact": st.column_config.ProgressColumn("Impact", min_value=0, max_value=100, format="%.0f")})
+        if not has_values(players, "player", "goals"):
+            unavailable_notice("Goal-scorer data")
+        else:
+            p = players[players["team"].eq(selected)].sort_values("goals", ascending=False).head(5).copy()
+            if p.empty:
+                st.caption(f"No goal scorers recorded for {selected}.")
+            else:
+                show = ["player", "goals"] + (["assists"] if has_values(players, "assists") else [])
+                st.dataframe(p[show], use_container_width=True, hide_index=True)
 
     st.markdown("#### Defensive & Set-Piece Profile")
     d1, d2, d3 = st.columns(3)
@@ -675,22 +690,27 @@ def team_intelligence():
     with d2:
         card("Goals Against", str(m.get("goals_against", "N/A")), "🥅", "season to date")
     with d3:
-        card("Set-Piece Goals", str(m.get("setpiece_goals", "N/A")), "🎯", "corners + free kicks")
+        card("Set-Piece Goals", fmt(m.get("setpiece_goals")), "🎯", "corners + free kicks")
 
     st.markdown("#### Efficiency Checks")
     e1, e2 = st.columns(2)
     with e1:
-        delta = float(m.goals_for) - float(m.xg)
-        if delta < -0.5:
+        delta = float(m.goals_for) - float(m.xg) if pd.notna(m.get("xg")) else None
+        if delta is None:
+            unavailable_notice("Expected goals (xG)")
+        elif delta < -0.5:
             insight("Finishing Concern", f"{selected} are underperforming their underlying chances by {abs(delta):.1f} xG — creating the openings, missing the finish.")
         elif delta > 0.5:
             insight("Finishing Strength", f"{selected} are overperforming their xG by {delta:+.1f} — clinical relative to chance quality.")
         else:
             insight("Finishing in Line with xG", f"{selected}'s goal output ({m.goals_for}) closely tracks their underlying chance quality ({float(m.xg):.1f} xG).")
     with e2:
-        poss_rank = int(metrics["possession_pct"].rank(ascending=False, method="min")[metrics["team"] == selected].iloc[0])
+        poss_rank_s = metrics["possession_pct"].rank(ascending=False, method="min")[metrics["team"] == selected] if "possession_pct" in metrics.columns else pd.Series(dtype=float)
         goals_rank = int(metrics["goals_for"].rank(ascending=False, method="min")[metrics["team"] == selected].iloc[0])
-        if poss_rank <= 10 and goals_rank > 15:
+        poss_rank = None if poss_rank_s.empty or pd.isna(poss_rank_s.iloc[0]) else int(poss_rank_s.iloc[0])
+        if poss_rank is None:
+            unavailable_notice("Possession")
+        elif poss_rank <= 10 and goals_rank > 15:
             insight("Possession Without Punch", f"{selected} rank #{poss_rank} for possession but only #{goals_rank} for goals — control isn't converting into a scoreboard edge.")
         else:
             insight("Possession-to-Goals Balance", f"Possession rank #{poss_rank} lines up reasonably with goal-scoring rank #{goals_rank}.")
@@ -708,8 +728,12 @@ def team_intelligence():
         missing_data_notice("matches.parquet (stage column)", "Once populated: a group-stage vs knockout scoring comparison for this team.")
 
     st.markdown("#### Team Comparison Matrix")
-    fig = px.scatter(metrics, x="possession_pct", y="pass_accuracy_pct", size="goals_for", color="xg", hover_name="team", color_continuous_scale=[INDIGO, CYAN, NEON], title="Possession vs Passing Efficiency")
-    st.plotly_chart(fig_layout(fig), use_container_width=True)
+    if has_values(metrics, "possession_pct", "pass_accuracy_pct"):
+        matrix = metrics.dropna(subset=["possession_pct", "pass_accuracy_pct"])
+        fig = px.scatter(matrix, x="possession_pct", y="pass_accuracy_pct", size="goals_for", color="xg" if has_values(matrix, "xg") else None, hover_name="team", color_continuous_scale=[INDIGO, CYAN, NEON], title="Possession vs Passing Efficiency")
+        st.plotly_chart(fig_layout(fig), use_container_width=True)
+    else:
+        unavailable_notice("Possession and pass accuracy")
 
 
 # ---------------------------------------------------------------------------
@@ -717,19 +741,19 @@ def team_intelligence():
 # ---------------------------------------------------------------------------
 
 def player_leaderboard():
-    hero("🥇 Player Leaderboard", "Golden Boot race, playmakers, goalkeepers, and group-vs-knockout form.")
+    hero("🥇 Player Leaderboard", "Golden Boot race from source goal events.")
     players, ok = safe_load("top_players.parquet")
     if not ok:
         missing_data_notice("top_players.parquet")
         return
 
     p = players.copy()
-    for col in ("goals", "assists", "xg"):
-        if col not in p.columns:
-            p[col] = 0
-    p[["goals", "assists", "xg"]] = p[["goals", "assists", "xg"]].fillna(0)
-    p["contributions"] = p["goals"] + p["assists"]
-    p["finishing_delta"] = p["goals"] - p["xg"]
+    has_assists = has_values(p, "assists")
+    has_xg = has_values(p, "xg")
+    p["goals"] = p["goals"].fillna(0) if "goals" in p.columns else 0
+    p["contributions"] = p["goals"] + (p["assists"].fillna(0) if has_assists else 0)
+    if has_xg:
+        p["finishing_delta"] = p["goals"] - p["xg"]
 
     f1, f2 = st.columns(2)
     with f1:
@@ -749,7 +773,7 @@ def player_leaderboard():
     if pos_sel != "All" and "position" in view.columns:
         view = view[view["position"] == pos_sel]
 
-    tab_outfield, tab_gk, tab_form = st.tabs(["⚽ Outfield Leaderboard", "🧤 Goalkeepers", "📈 Group vs Knockout Form"])
+    tab_outfield, tab_more = st.tabs(["⚽ Outfield Leaderboard", "🧤 Goalkeepers & Player Form"])
 
     with tab_outfield:
         if not view.empty:
@@ -758,11 +782,17 @@ def player_leaderboard():
                 top_scorer = view.sort_values("goals", ascending=False).iloc[0]
                 insight("Golden Boot Leader", f"{top_scorer.player} ({top_scorer.team}) — {int(top_scorer.goals)} goals.")
             with c2:
-                top_assist = view.sort_values("assists", ascending=False).iloc[0]
-                insight("Playmaker Leader", f"{top_assist.player} ({top_assist.team}) — {int(top_assist.assists)} assists.")
+                if has_assists:
+                    top_assist = view.sort_values("assists", ascending=False).iloc[0]
+                    insight("Playmaker Leader", f"{top_assist.player} ({top_assist.team}) — {int(top_assist.assists)} assists.")
+                else:
+                    unavailable_notice("Assist data")
             with c3:
-                clinical = view.sort_values("finishing_delta", ascending=False).iloc[0]
-                insight("Most Clinical Finisher", f"{clinical.player} is {clinical.finishing_delta:+.1f} goals ahead of his xG.")
+                if has_xg:
+                    clinical = view.sort_values("finishing_delta", ascending=False).iloc[0]
+                    insight("Most Clinical Finisher", f"{clinical.player} is {clinical.finishing_delta:+.1f} goals ahead of his xG.")
+                else:
+                    unavailable_notice("Player xG")
 
         g1, g2 = st.columns(2)
         with g1:
@@ -770,20 +800,23 @@ def player_leaderboard():
             fig = px.bar(top10, x="goals", y="player", orientation="h", color="team", title="Golden Boot Race — Top 10 Scorers")
             st.plotly_chart(fig_layout(fig), use_container_width=True)
         with g2:
-            fig = px.scatter(view, x="xg", y="goals", size="contributions", color="team", hover_name="player", title="Finishing Quality — Goals vs Expected Goals")
-            max_v = float(max(view["xg"].max() if not view.empty else 1, view["goals"].max() if not view.empty else 1, 1))
-            fig.add_shape(type="line", x0=0, y0=0, x1=max_v, y1=max_v, line=dict(color="#9DB4C8", dash="dot"))
-            st.plotly_chart(fig_layout(fig), use_container_width=True)
+            if has_xg:
+                fig = px.scatter(view, x="xg", y="goals", size="contributions", color="team", hover_name="player", title="Finishing Quality — Goals vs Expected Goals")
+                max_v = float(max(view["xg"].max() if not view.empty else 1, view["goals"].max() if not view.empty else 1, 1))
+                fig.add_shape(type="line", x0=0, y0=0, x1=max_v, y1=max_v, line=dict(color="#9DB4C8", dash="dot"))
+                st.plotly_chart(fig_layout(fig), use_container_width=True)
+            else:
+                unavailable_notice("Player xG")
 
-        if {"tackles", "interceptions"}.issubset(view.columns):
+        if has_values(view, "tackles", "interceptions"):
             st.markdown("##### Defensive Workload")
             dview = view.sort_values("tackles", ascending=False).head(10)
             fig = px.bar(dview, x="tackles", y="player", orientation="h", color="interceptions", title="Top 10 — Tackles (color = Interceptions)", color_continuous_scale=[INDIGO, CYAN, NEON])
             st.plotly_chart(fig_layout(fig), use_container_width=True)
         else:
-            missing_data_notice("top_players.parquet (tackles, interceptions columns)", "Once populated: a defensive-workload leaderboard.")
+            unavailable_notice("Tackles and interceptions")
 
-        if "rating" in view.columns and not view.empty:
+        if has_values(view, "rating"):
             st.markdown("##### Player Rating Leaders")
             rview = view.sort_values("rating", ascending=False).head(10)
             fig = px.bar(rview, x="rating", y="player", orientation="h", color="team", title="Top 10 — Average Player Rating")
@@ -791,48 +824,11 @@ def player_leaderboard():
 
         st.markdown("#### Full Leaderboard")
         base_cols = [c for c in ["player", "team", "position", "goals", "assists", "xg", "rating", "pass_accuracy_pct", "tackles", "interceptions"] if c in view.columns]
-        show_cols = base_cols + ["finishing_delta", "contributions"]
+        show_cols = base_cols + (["finishing_delta"] if has_xg else []) + ["contributions"]
         st.dataframe(view.sort_values("contributions", ascending=False)[show_cols], use_container_width=True, hide_index=True)
 
-    with tab_gk:
-        gk, gk_ok = safe_load("goalkeepers.parquet")
-        if not gk_ok:
-            missing_data_notice("goalkeepers.parquet", "Once populated: save percentage, penalty saves, and clean-sheet leaders.")
-        else:
-            gview = gk[gk["team"] == team_sel] if (team_sel != "All" and "team" in gk.columns) else gk
-            c1, c2 = st.columns(2)
-            with c1:
-                if "save_pct" in gview.columns and not gview.empty:
-                    best = gview.sort_values("save_pct", ascending=False).iloc[0]
-                    insight("Best Save Percentage", f"{best.player} ({best.team}) — {best.save_pct:.1f}% of shots faced saved.")
-            with c2:
-                if "penalties_saved" in gview.columns and not gview.empty:
-                    pk = gview.sort_values("penalties_saved", ascending=False).iloc[0]
-                    if pk.penalties_saved and pk.penalties_saved > 0:
-                        insight("Penalty Stopper", f"{pk.player} ({pk.team}) has saved {int(pk.penalties_saved)} penalty kick(s).")
-            if "save_pct" in gview.columns and not gview.empty:
-                fig = px.bar(gview.sort_values("save_pct", ascending=True).tail(10), x="save_pct", y="player", orientation="h", color="team", title="Top 10 — Save Percentage")
-                st.plotly_chart(fig_layout(fig), use_container_width=True)
-            st.dataframe(gview, use_container_width=True, hide_index=True)
-
-    with tab_form:
-        mps, mps_ok = safe_load("match_player_stats.parquet")
-        if not mps_ok:
-            missing_data_notice("match_player_stats.parquet", "Once populated: per-player group-stage vs knockout form, and a rising-form trend across matchdays.")
-        else:
-            scope = mps[mps["team"] == team_sel] if (team_sel != "All" and "team" in mps.columns) else mps
-            if {"player", "stage", "rating"}.issubset(scope.columns) and not scope.empty:
-                split = scope.groupby(["player", "stage"])["rating"].mean().reset_index()
-                top_players_list = scope.groupby("player")["rating"].mean().sort_values(ascending=False).head(8).index.tolist()
-                split = split[split["player"].isin(top_players_list)]
-                fig = px.bar(split, x="player", y="rating", color="stage", barmode="group", title="Avg Rating — Group Stage vs Knockout (Top 8 by rating)")
-                st.plotly_chart(fig_layout(fig), use_container_width=True)
-            if {"player", "goals", "matchday"}.issubset(scope.columns) and not scope.empty:
-                st.caption("Pick a player to see their goal-scoring trend across the tournament.")
-                player_pick = st.selectbox("Player form trend", sorted(scope["player"].dropna().unique().tolist()), key="form_player_pick")
-                ptrend = scope[scope["player"] == player_pick].sort_values("matchday")
-                fig = px.line(ptrend, x="matchday", y="goals", markers=True, title=f"{player_pick} — Goals by Matchday")
-                st.plotly_chart(fig_layout(fig), use_container_width=True)
+    with tab_more:
+        unavailable_notice("Goalkeeper saves, player ratings and per-match player stats")
 
 
 # ---------------------------------------------------------------------------
@@ -858,9 +854,13 @@ def venues_cities():
 
     m1, m2 = st.columns([1.3, .7])
     with m1:
-        fig = px.scatter_mapbox(cities, lat="lat", lon="lon", size="matches", color="country", hover_name="city", hover_data=["stadium", "matches"], zoom=2.2, height=480, title="Stadium Workload Map")
-        fig.update_layout(mapbox_style="carto-darkmatter", mapbox=dict(center={"lat": 38, "lon": -96}), margin=dict(l=0, r=0, t=45, b=0))
-        st.plotly_chart(fig_layout(fig), use_container_width=True)
+        mapped = cities.dropna(subset=["lat", "lon"]) if {"lat", "lon"}.issubset(cities.columns) else pd.DataFrame()
+        if mapped.empty:
+            unavailable_notice("Stadium coordinates")
+        else:
+            fig = px.scatter_mapbox(mapped, lat="lat", lon="lon", size="matches", color="country", hover_name="city", hover_data=["stadium", "matches"], zoom=2.2, height=480, title="Stadium Workload Map")
+            fig.update_layout(mapbox_style="carto-darkmatter", mapbox=dict(center={"lat": 38, "lon": -96}), margin=dict(l=0, r=0, t=45, b=0))
+            st.plotly_chart(fig_layout(fig), use_container_width=True)
     with m2:
         ranked = cities.sort_values("matches", ascending=True)
         fig = px.bar(ranked, x="matches", y="stadium", orientation="h", color="country", title="Stadiums Ranked by Matches Hosted")
@@ -874,16 +874,20 @@ def venues_cities():
 # Router
 # ---------------------------------------------------------------------------
 
-page = sidebar()
-if page == "⚽ Overview":
-    overview()
-elif page == "🏟️ Match Center":
-    match_center()
-elif page == "🏆 Group Standings":
-    standings()
-elif page == "📊 Team Intelligence":
-    team_intelligence()
-elif page == "🥇 Player Leaderboard":
-    player_leaderboard()
-else:
-    venues_cities()
+mock_banner = begin_mock_tracking()
+try:
+    page = sidebar()
+    if page == "⚽ Overview":
+        overview()
+    elif page == "🏟️ Match Center":
+        match_center()
+    elif page == "🏆 Group Standings":
+        standings()
+    elif page == "📊 Team Intelligence":
+        team_intelligence()
+    elif page == "🥇 Player Leaderboard":
+        player_leaderboard()
+    else:
+        venues_cities()
+finally:
+    render_mock_banner(mock_banner)

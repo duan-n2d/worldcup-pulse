@@ -12,6 +12,9 @@ from huggingface_hub import hf_hub_download
 HF_DATASET_REPO = os.environ.get("HF_DATASET_REPO", "your-username/worldcup-pulse-data")
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
+# Tables that fell back to mock data during the current script run, with the reason.
+_MOCK_STATE_KEY = "_worldcup_pulse_mock_tables"
+
 TEAMS = [
     ("CAN", "Canada", "🇨🇦", 31, "A"), ("MEX", "Mexico", "🇲🇽", 15, "A"), ("USA", "United States", "🇺🇸", 11, "B"),
     ("BRA", "Brazil", "🇧🇷", 5, "C"), ("FRA", "France", "🇫🇷", 2, "D"), ("ARG", "Argentina", "🇦🇷", 1, "E"),
@@ -24,28 +27,74 @@ def _download(path_in_repo: str) -> str:
     return hf_hub_download(repo_id=HF_DATASET_REPO, repo_type="dataset", filename=path_in_repo, token=HF_TOKEN)
 
 
+def begin_mock_tracking():
+    """Call once at the top of the app script; returns the slot the mock-data banner renders into."""
+    st.session_state[_MOCK_STATE_KEY] = {}
+    return st.empty()
+
+
+def _record_mock(name: str, reason: str) -> None:
+    st.session_state.setdefault(_MOCK_STATE_KEY, {})[name] = reason
+
+
+def render_mock_banner(slot) -> None:
+    """Fill the banner slot if any table on this run was served from mock data."""
+    mocked = st.session_state.get(_MOCK_STATE_KEY) or {}
+    if not mocked:
+        return
+    tables = ", ".join(f"`{name}`" for name in sorted(mocked))
+    reason = next(iter(mocked.values()))
+    slot.warning(
+        f"**MOCK DATA — not real tournament results.** The Hugging Face dataset `{HF_DATASET_REPO}` could not be read, "
+        f"so these tables show built-in sample values: {tables}. First error: {reason}",
+        icon="⚠️",
+    )
+
+
 @st.cache_data(ttl=300, show_spinner=False)
-def load_gold_table(filename: str) -> pd.DataFrame:
+def _load_gold_cached(filename: str) -> tuple[pd.DataFrame, str | None]:
     try:
         path = _download(f"gold/{filename}")
-        return duckdb.sql(f"SELECT * FROM '{path}'").df()
-    except Exception:
-        return _mock_fallback(filename)
+        return duckdb.sql(f"SELECT * FROM '{path}'").df(), None
+    except Exception as exc:
+        mock = _mock_fallback(filename)
+        if mock is None:
+            raise
+        return mock, f"{type(exc).__name__}: {exc}"
+
+
+def load_gold_table(filename: str) -> pd.DataFrame:
+    """Read a gold mart from the HF dataset; on failure, serve mock data and flag it for the banner.
+
+    Tables without a mock (marts the pipeline no longer produces) re-raise the error.
+    """
+    df, mock_reason = _load_gold_cached(filename)
+    if mock_reason:
+        _record_mock(filename, mock_reason)
+    return df
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_log_table(filename: str) -> pd.DataFrame:
+def _load_log_cached(filename: str) -> tuple[pd.DataFrame, str | None]:
     try:
         path = _download(f"logs/{filename}")
-        return pd.read_csv(path)
-    except Exception:
+        return pd.read_csv(path), None
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
         if filename == "pipeline_runs.csv":
             now = datetime.now(timezone.utc).isoformat()
             return pd.DataFrame([
                 {"run_id": "mock_002", "started_at": now, "finished_at": now, "status": "Success", "rows_bronze": 408, "rows_silver": 312, "rows_gold": 256, "error_message": "mock fallback"},
                 {"run_id": "mock_001", "started_at": (datetime.now(timezone.utc) - timedelta(minutes=35)).isoformat(), "finished_at": now, "status": "QualityFailed", "rows_bronze": 390, "rows_silver": 310, "rows_gold": 240, "error_message": "sample warning"},
-            ])
-        return _mock_quality()
+            ]), reason
+        return _mock_quality(), reason
+
+
+def load_log_table(filename: str) -> pd.DataFrame:
+    df, mock_reason = _load_log_cached(filename)
+    if mock_reason:
+        _record_mock(filename, mock_reason)
+    return df
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -87,7 +136,7 @@ def _mock_matches() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _mock_fallback(filename: str) -> pd.DataFrame:
+def _mock_fallback(filename: str) -> pd.DataFrame | None:
     teams = _teams()
     rng = _rng()
     if filename == "kpi_summary.parquet":
@@ -155,39 +204,8 @@ def _mock_fallback(filename: str) -> pd.DataFrame:
                     seed = sum(ord(c) for c in f"{m.match_id}{team_col}{g}")
                     rows.append({"event_id": f"{m.match_id}_{team_col}_{g+1}", "match_id": m.match_id, "minute": minute, "half": 1 if minute <= 45 else 2, "event_type": "goal", "team": m[team_col], "team_id": str(m[team_col])[:3].upper(), "player": f"{m[team_col]} Player {g+1}", "assist_player": f"{m[team_col]} Creator {g+1}", "shot_x": 68 + seed % 24, "shot_y": 18 + seed % 64})
         return pd.DataFrame(rows)
-    if filename == "substitutions.parquet":
-        rows = []
-        for _, m in _mock_matches().iterrows():
-            for team in [m.home_team, m.away_team]:
-                for minute, idx in [(62, 12), (76, 13), (84, 14)]:
-                    rows.append({"match_id": m.match_id, "team": team, "minute": minute, "player_off": f"{team} Player {idx-5}", "player_on": f"{team} Player {idx}"})
-        return pd.DataFrame(rows)
-    if filename == "lineups.parquet":
-        rows = []
-        for _, m in _mock_matches().iterrows():
-            for team in [m.home_team, m.away_team]:
-                for n in range(1, 12):
-                    pos = ["GK", "DF", "DF", "DF", "DF", "MF", "MF", "MF", "FW", "FW", "FW"][n-1]
-                    rows.append({"match_id": m.match_id, "team": team, "player": f"{team} {pos} {n}", "position": pos, "shirt_number": n, "is_starting": True})
-        return pd.DataFrame(rows)
-    if filename == "goalkeepers.parquet":
-        rows = []
-        for _, t in teams.iterrows():
-            seed = sum(ord(c) for c in t.team)
-            saves = 8 + seed % 18
-            conceded = seed % 6
-            rows.append({"player": f"{t.team} Goalkeeper 1", "team": t.team, "saves": saves, "save_pct": round(100 * saves / max(1, saves + conceded), 1), "penalties_saved": seed % 2, "clean_sheets": seed % 4, "goals_conceded": conceded})
-        return pd.DataFrame(rows)
-    if filename == "match_player_stats.parquet":
-        rows = []
-        for _, m in _mock_matches().iterrows():
-            for team in [m.home_team, m.away_team]:
-                for n in range(1, 12):
-                    player = f"{team} Player {n}"
-                    seed = sum(ord(c) for c in f"{m.match_id}{player}")
-                    rows.append({"match_id": m.match_id, "player": player, "team": team, "stage": m.stage, "matchday": m.matchday, "minutes_played": 90 if n <= 8 else 68 + seed % 22, "goals": 1 if (n >= 9 and seed % 5 == 0) else 0, "assists": 1 if (n >= 6 and seed % 7 == 0) else 0, "rating": round(6.0 + (seed % 28) / 10, 2), "distance_km": round(7.5 + (seed % 45) / 10, 1), "sprint_speed_kmh": round(27.5 + (seed % 60) / 10, 1), "pass_accuracy_pct": round(72 + (seed % 24), 1), "tackles": seed % 7, "interceptions": (seed // 4) % 7})
-        return pd.DataFrame(rows)
-    return pd.DataFrame()
+    # No mock for marts the pipeline does not produce (they used to be synthetic).
+    return None
 
 
 def _mock_quality() -> pd.DataFrame:

@@ -24,7 +24,7 @@ This app is stateless. It reads the latest gold marts from the Hugging Face Data
 - 🥇 Player Leaderboard
 - 🌆 Venues & Cities
 
-The app has mock fallback data for every table used by the UI, so the Space can demo immediately before the first ETL run lands data in the HF Dataset.
+If the HF Dataset cannot be read, the app falls back to built-in mock data so the Space still renders. Whenever that happens, a **"MOCK DATA — not real tournament results"** banner names the affected tables. Stats the source API does not provide (for example xG, possession, cards, lineups, and goalkeeper stats) show as "N/A" or a "Not available" note. They are never estimated.
 
 ## Required Space secrets
 

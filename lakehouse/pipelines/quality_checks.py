@@ -5,8 +5,15 @@ import pandas as pd
 from common import LOGS_DIR, SILVER_DIR, GOLD_DIR, iso_now, read_parquet
 
 
-def _check(rows: list[dict], layer: str, table: str, check_name: str, passed: bool, message: str) -> None:
-    rows.append({"checked_at": iso_now(), "layer": layer, "table": table, "check_name": check_name, "status": "Pass" if passed else "Fail", "message": message})
+def _check(rows: list[dict], layer: str, table: str, check_name: str, passed: bool, message: str, severity: str = "Fail") -> None:
+    # severity="Warn" is for tables that are legitimately empty when the source API omits that detail
+    # (e.g. no goal-scorer lists); they are reported but do not fail the run.
+    rows.append({"checked_at": iso_now(), "layer": layer, "table": table, "check_name": check_name, "status": "Pass" if passed else severity, "message": message})
+
+
+# Only populated when the source payload carries goal/event details or stadium data.
+OPTIONAL_SILVER = {"events", "players"}
+OPTIONAL_GOLD = {"match_events", "top_players", "host_cities"}
 
 
 def run_quality_checks() -> tuple[pd.DataFrame, bool]:
@@ -21,18 +28,17 @@ def run_quality_checks() -> tuple[pd.DataFrame, bool]:
     _check(rows, "Silver", "teams", "unique_team_id", teams.empty or teams["team_id"].is_unique, f"duplicate_team_id={teams['team_id'].duplicated().sum() if not teams.empty else 0}")
     _check(rows, "Silver", "matches", "not_empty", len(matches) > 0, f"rows={len(matches)}")
     for table_name, df in [("team_match_stats", stats), ("events", events), ("players", players)]:
-        _check(rows, "Silver", table_name, "not_empty", len(df) > 0, f"rows={len(df)}")
+        _check(rows, "Silver", table_name, "not_empty", len(df) > 0, f"rows={len(df)}", "Warn" if table_name in OPTIONAL_SILVER else "Fail")
         missing = 0 if df.empty or "team_id" not in df.columns else (~df["team_id"].astype(str).isin(valid_teams)).sum()
         _check(rows, "Silver", table_name, "fk_team_id", missing == 0, f"missing_team_refs={int(missing)}")
     gold_tables = [
         "kpi_summary", "goals_by_matchday", "goals_by_minute_bucket", "host_cities",
         "team_radar_stats", "team_key_metrics", "top_players", "team_table",
-        "matches", "group_standings", "match_events", "substitutions",
-        "lineups", "goalkeepers", "match_player_stats",
+        "matches", "group_standings", "match_events",
     ]
     for table in gold_tables:
         df = read_parquet(GOLD_DIR / f"{table}.parquet")
-        _check(rows, "Gold", table, "not_empty", len(df) > 0, f"rows={len(df)}")
+        _check(rows, "Gold", table, "not_empty", len(df) > 0, f"rows={len(df)}", "Warn" if table in OPTIONAL_GOLD else "Fail")
     gold_matches = read_parquet(GOLD_DIR / "matches.parquet")
     if not gold_matches.empty and "status" in gold_matches.columns:
         allowed = {"completed", "live", "scheduled"}
@@ -45,5 +51,5 @@ def run_quality_checks() -> tuple[pd.DataFrame, bool]:
     report = pd.DataFrame(rows)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     report.to_csv(LOGS_DIR / "quality_checks.csv", index=False)
-    passed = bool((report["status"] == "Pass").all())
+    passed = bool((report["status"] != "Fail").all())
     return report, passed

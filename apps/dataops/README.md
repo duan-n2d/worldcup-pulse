@@ -17,8 +17,9 @@ Technical monitoring Streamlit Space for WorldCup Pulse Lakehouse.
 
 - Pipeline heartbeat from `logs/pipeline_runs.csv`
 - Data quality tabs from `logs/quality_checks.csv`
-- DuckDB console over all gold marts, including match, group, event, lineup, goalkeeper, and player-stat marts
-- Last sync and next scheduled run indicators
+- DuckDB console over all gold marts, including the match, group-standings, and match-event marts
+- Last sync indicator (the scheduled refresh is disabled, so the next run shows as "Manual only")
+- A "MOCK DATA" banner whenever logs or marts fall back to built-in sample data because the HF Dataset could not be read
 
 ## Required Space secrets
 

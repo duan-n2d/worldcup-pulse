@@ -44,6 +44,9 @@ def upload_data_to_hf(repo_id: str | None = None, token: str | None = None, used
         folder_path=str(DATA_DIR),
         path_in_repo=".",
         ignore_patterns=["raw/**"],
+        # Replace the gold layer wholesale so retired marts (e.g. the former synthetic
+        # lineups/substitutions/goalkeepers/match_player_stats) do not linger remotely.
+        delete_patterns=["gold/*.parquet"],
         commit_message="refresh worldcup pulse lakehouse data",
     )
     return "UPLOADED"
