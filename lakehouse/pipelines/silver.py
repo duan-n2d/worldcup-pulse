@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+from datetime import datetime
 from typing import Any
 
 import pandas as pd
@@ -38,14 +40,14 @@ def _team_aliases(teams: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
     alias: dict[str, str] = {}
     for _, row in teams.iterrows():
         raw_id = _row_get(row, ["id", "team_id", "country_id"])
-        name = clean_text(_row_get(row, ["name", "team", "country", "country_name"], "Unknown"))
+        name = clean_text(_row_get(row, ["name", "name_en", "team", "country", "country_name"], "Unknown"))
         code = clean_text(_row_get(row, ["fifa_code", "code", "abbreviation", "iso2", "iso3"], ""))
         if not code or len(code) < 2:
             code = canonical_id(name)[:3]
         team_id = canonical_id(code)
         if is_placeholder_team(name) or is_placeholder_team(team_id):
             continue
-        group_name = clean_text(_row_get(row, ["group", "group_name", "group_group_name"], "Unknown"))
+        group_name = clean_text(_row_get(row, ["group", "groups", "group_name", "group_group_name"], "Unknown"))
         fifa_rank = _row_get(row, ["rank", "fifa_rank", "ranking"], 999)
         try:
             fifa_rank = int(float(fifa_rank))
@@ -76,12 +78,12 @@ def _resolve_team(value: Any, alias: dict[str, str]) -> str:
 def _stadiums(stadiums: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for _, row in stadiums.iterrows():
-        name = clean_text(_row_get(row, ["name", "stadium", "venue"], "Unknown Stadium"))
+        name = clean_text(_row_get(row, ["name", "name_en", "stadium", "venue"], "Unknown Stadium"))
         rows.append({
             "stadium_id": canonical_id(_row_get(row, ["id", "stadium_id", "name"], name)),
             "stadium": name,
-            "city": clean_text(_row_get(row, ["city", "location_city"], "Unknown")),
-            "country": clean_text(_row_get(row, ["country", "location_country"], "Unknown")),
+            "city": clean_text(_row_get(row, ["city", "city_en", "location_city"], "Unknown")),
+            "country": clean_text(_row_get(row, ["country", "country_en", "location_country"], "Unknown")),
             "lat": pd.to_numeric(pd.Series([_row_get(row, ["lat", "latitude", "location_lat"], None)]), errors="coerce").iloc[0],
             "lon": pd.to_numeric(pd.Series([_row_get(row, ["lon", "lng", "longitude", "location_lon"], None)]), errors="coerce").iloc[0],
         })
@@ -120,11 +122,57 @@ def _side_stat(row: pd.Series, side: str, names: list[str]) -> float | None:
     return None if pd.isna(value) else float(value)
 
 
+STAGE_NAMES = {"group": "Group", "r32": "R32", "r16": "R16", "qf": "QF", "sf": "SF", "third": "3rd place", "final": "Final"}
+
+# The WorldCup26 API lists scorers per side as a brace-wrapped string, e.g.
+# {"J. Quiñones 9'","K. Havertz 45'+5'(p)","D. Bobadilla 7'(OG)","Y. Tielemans 125(P)'"}
+# (sometimes with curly quotes), or the string "null".
+_SCORER_RE = re.compile(
+    r"^(?P<player>.+?)\s*(?P<minute>\d{1,3})'?\s*(?:\+\s*(?P<added>\d{1,2})'?)?\s*(?:\((?P<tag>OG|og|p|P)\))?\s*'?$"
+)
+_QUOTES = "\"“”„«»"
+
+
+def parse_scorers(value: Any) -> list[dict[str, Any]]:
+    """Parse one side's scorer string into goal events. Unparseable tokens are skipped."""
+    if not isinstance(value, str):
+        return []
+    text = value.strip()
+    if not text or text.lower() == "null":
+        return []
+    out = []
+    for token in re.split(r"[,،]", text.strip("{}[]")):
+        token = token.strip().strip(_QUOTES).strip()
+        m = _SCORER_RE.match(token)
+        if not m:
+            continue
+        tag = (m.group("tag") or "").lower()
+        out.append({
+            "player": m.group("player").strip(),
+            "minute": int(m.group("minute")),
+            "added_time": int(m.group("added")) if m.group("added") else None,
+            "event_type": "own_goal" if tag == "og" else ("penalty_goal" if tag == "p" else "goal"),
+        })
+    return out
+
+
+def _local_kickoff(value: Any) -> str:
+    """'06/27/2026 19:30' (stadium local time) -> '2026-06-27 19:30'."""
+    text = clean_text(value)
+    for fmt in ("%m/%d/%Y %H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            continue
+    return ""
+
+
 def build_silver() -> dict[str, pd.DataFrame]:
     bronze = _load_bronze()
     teams_df, alias = _team_aliases(bronze.get("teams", pd.DataFrame()))
     stadiums_df = _stadiums(bronze.get("stadiums", pd.DataFrame()))
     games = bronze.get("games", pd.DataFrame())
+    stadium_lu = stadiums_df.set_index("stadium_id").to_dict("index") if not stadiums_df.empty else {}
 
     matches = []
     slots = []
@@ -137,9 +185,10 @@ def build_silver() -> dict[str, pd.DataFrame]:
         matchday = _row_get(row, ["matchday", "day", "round", "match_number"], 1)
         try: matchday = int(float(matchday))
         except Exception: matchday = 1
-        stage = clean_text(_row_get(row, ["stage", "round", "phase"], "Unknown"))
-        home_raw = _row_get(row, ["home_team", "home", "team1", "home_name", "homeTeam_name", "home_team_name"], "")
-        away_raw = _row_get(row, ["away_team", "away", "team2", "away_name", "awayTeam_name", "away_team_name"], "")
+        stage = clean_text(_row_get(row, ["stage", "round", "phase", "type"], "Unknown"))
+        stage = STAGE_NAMES.get(stage.lower(), stage)
+        home_raw = _row_get(row, ["home_team", "home", "team1", "home_name", "homeTeam_name", "home_team_name", "home_team_id"], "")
+        away_raw = _row_get(row, ["away_team", "away", "team2", "away_name", "awayTeam_name", "away_team_name", "away_team_id"], "")
         home_id = _resolve_team(home_raw, alias)
         away_id = _resolve_team(away_raw, alias)
         for val, tid in [(home_raw, home_id), (away_raw, away_id)]:
@@ -147,9 +196,12 @@ def build_silver() -> dict[str, pd.DataFrame]:
                 slots.append({"slot_id": tid, "slot_label": clean_text(val), "stage": stage, "match_id": match_id})
         home_score = _extract_score(row, ["home_score", "home_goals", "score_home", "homeTeam_score"])
         away_score = _extract_score(row, ["away_score", "away_goals", "score_away", "awayTeam_score"])
-        status = clean_text(_row_get(row, ["status", "state"], "scheduled")) or "scheduled"
-        city = clean_text(_row_get(row, ["city", "venue_city"], "Unknown"))
-        stadium = clean_text(_row_get(row, ["stadium", "venue", "stadium_name"], "Unknown Stadium"))
+        status = clean_text(_row_get(row, ["status", "state", "time_elapsed"], "scheduled")) or "scheduled"
+        venue = stadium_lu.get(canonical_id(_row_get(row, ["stadium_id"], "")), {})
+        city = clean_text(_row_get(row, ["city", "venue_city"], venue.get("city", "Unknown")))
+        stadium = clean_text(_row_get(row, ["stadium", "venue", "stadium_name"], venue.get("stadium", "Unknown Stadium")))
+        home_label = clean_text(_row_get(row, ["home_team_label", "home_team_name_en"], home_raw))
+        away_label = clean_text(_row_get(row, ["away_team_label", "away_team_name_en"], away_raw))
         attendance = pd.to_numeric(pd.Series([_row_get(row, ["attendance", "spectators"], None)]), errors="coerce").iloc[0]
         matches.append({
             "match_id": match_id,
@@ -159,19 +211,23 @@ def build_silver() -> dict[str, pd.DataFrame]:
             "status": status,
             "home_team_id": home_id,
             "away_team_id": away_id,
-            "home_team_label": clean_text(home_raw),
-            "away_team_label": clean_text(away_raw),
+            "home_team_label": home_label,
+            "away_team_label": away_label,
             "home_score": home_score,
             "away_score": away_score,
             "stadium": stadium,
             "city": city,
             "kickoff_utc": clean_text(_row_get(row, ["date", "datetime", "kickoff", "time"], "")),
+            "kickoff_local": _local_kickoff(_row_get(row, ["local_date"], "")),
+            "home_penalty_score": _extract_score(row, ["home_penalty_score"]),
+            "away_penalty_score": _extract_score(row, ["away_penalty_score"]),
             "attendance": None if pd.isna(attendance) else int(attendance),
         })
         if home_id in valid_team_ids and away_id in valid_team_ids and home_score is not None and away_score is not None:
             for side, team_id, goals_for, goals_against in [("home", home_id, home_score, away_score), ("away", away_id, away_score, home_score)]:
                 stats_rows.append({
                     "match_id": match_id,
+                    "stage": stage,
                     "team_id": team_id,
                     "goals_for": goals_for,
                     "goals_against": goals_against,
@@ -199,12 +255,25 @@ def build_silver() -> dict[str, pd.DataFrame]:
             assist = clean_text(first_present(ev, ["assist", "assist_player", "assist_name"], ""))
             event_type = clean_text(first_present(ev, ["type", "event_type", "kind"], "goal")).lower() or "goal"
             events.append({"event_id": f"{match_id}_{i+1}", "match_id": match_id, "team_id": team_id, "player": player or None, "assist_player": assist or None, "event_type": event_type, "minute": minute})
-            if player:
+            if player and event_type != "own_goal":
                 position = clean_text(first_present(ev, ["position", "player_position"], ""))
                 players.append({"player_id": canonical_id(f"{team_id}_{player}"), "player": player, "team_id": team_id, "position": position or None})
+        # Per-side scorer strings (the WorldCup26 API format). The side is the team credited
+        # with the goal; for an own goal the named player belongs to the other side.
+        if not goal_list:
+            n = 0
+            for side, team_id in [("home", home_id), ("away", away_id)]:
+                if team_id not in valid_team_ids:
+                    continue
+                for ev in parse_scorers(_row_get(row, [f"{side}_scorers"], None)):
+                    n += 1
+                    events.append({"event_id": f"{match_id}_{n}", "match_id": match_id, "team_id": team_id, "player": ev["player"],
+                                   "assist_player": None, "event_type": ev["event_type"], "minute": ev["minute"]})
+                    if ev["event_type"] != "own_goal":
+                        players.append({"player_id": canonical_id(f"{team_id}_{ev['player']}"), "player": ev["player"], "team_id": team_id, "position": None})
     matches_df = pd.DataFrame(matches)
     slots_df = pd.DataFrame(slots).drop_duplicates("slot_id") if slots else pd.DataFrame(columns=["slot_id","slot_label","stage","match_id"])
-    stats_df = pd.DataFrame(stats_rows) if stats_rows else pd.DataFrame(columns=["match_id", "team_id", "goals_for", "goals_against", *SIDE_STATS])
+    stats_df = pd.DataFrame(stats_rows) if stats_rows else pd.DataFrame(columns=["match_id", "stage", "team_id", "goals_for", "goals_against", *SIDE_STATS])
     events_df = pd.DataFrame(events) if events else pd.DataFrame(columns=["event_id", "match_id", "team_id", "player", "assist_player", "event_type", "minute"])
     players_df = pd.DataFrame(players).drop_duplicates("player_id") if players else pd.DataFrame(columns=["player_id","player","team_id","position"])
     outputs = {"teams": teams_df, "stadiums": stadiums_df, "matches": matches_df, "fixture_slots": slots_df, "team_match_stats": stats_df, "events": events_df, "players": players_df}

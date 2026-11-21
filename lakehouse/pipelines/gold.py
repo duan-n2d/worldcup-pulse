@@ -106,13 +106,14 @@ def _build_gold_matches(matches: pd.DataFrame, teams: pd.DataFrame, stats: pd.Da
         home_meta = team_lu.get(home_id, {})
         away_meta = team_lu.get(away_id, {})
         md = _safe_int(m.get("matchday"), 1)
-        kickoff = str(m.get("kickoff_utc", "") or "")
+        kickoff = str(m.get("kickoff_local", "") or "") or str(m.get("kickoff_utc", "") or "")
         match_date = kickoff[:10] if len(kickoff) >= 10 and kickoff[:4].isdigit() else None
         rows.append({
             "match_id": str(m.get("match_id", "")),
             "matchday": md,
             "stage": str(m.get("stage", "Group")),
-            "group": home_meta.get("group_name", "Unknown"),
+            # Knockout matches have no group; only group-stage matches inherit the teams' group.
+            "group": home_meta.get("group_name", "Unknown") if str(m.get("stage", "Group")).lower().startswith("group") else None,
             "match_date": match_date,
             "kickoff_local": kickoff[11:16] if len(kickoff) >= 16 else None,
             "venue": str(m.get("stadium", "Unknown Stadium")),
@@ -127,6 +128,8 @@ def _build_gold_matches(matches: pd.DataFrame, teams: pd.DataFrame, stats: pd.Da
             "away_xg": xg_lu.get((str(m.get("match_id", "")), away_id), None),
             "attendance": _safe_int(m.get("attendance"), None) if pd.notna(m.get("attendance")) else None,
             "status": _norm_status(m),
+            "home_penalty_score": m.get("home_penalty_score"),
+            "away_penalty_score": m.get("away_penalty_score"),
         })
     return pd.DataFrame(rows).sort_values(["matchday", "match_id"]).reset_index(drop=True)
 
@@ -213,7 +216,8 @@ def _build_top_players(events_gold: pd.DataFrame, players: pd.DataFrame) -> pd.D
     cols = ["player", "team_id", "team", "position", "goals", "assists"]
     if events_gold.empty or "player" not in events_gold.columns:
         return pd.DataFrame(columns=cols)
-    goal_events = events_gold[events_gold["event_type"].astype(str).str.contains("goal", case=False, na=False) & events_gold["player"].notna()]
+    # Own goals count for the team but are not credited to the named player.
+    goal_events = events_gold[events_gold["event_type"].astype(str).isin(["goal", "penalty_goal"]) & events_gold["player"].notna()]
     if goal_events.empty:
         return pd.DataFrame(columns=cols)
     base = goal_events.groupby(["player", "team_id", "team"], as_index=False).agg(goals=("event_id", "count"))
@@ -236,6 +240,12 @@ def _build_group_standings(teams: pd.DataFrame, stats: pd.DataFrame) -> pd.DataF
         return pd.DataFrame()
     standings = []
     stats2 = stats.copy() if not stats.empty else pd.DataFrame(columns=["team_id", "goals_for", "goals_against"])
+    knockout_teams: set = set()
+    if "stage" in stats2.columns:
+        is_group = stats2["stage"].astype(str).str.lower().str.startswith("group")
+        knockout_teams = set(stats2.loc[~is_group, "team_id"].astype(str))
+        # Standings only count group-stage matches.
+        stats2 = stats2[is_group]
     for _, team in teams.iterrows():
         tid = team.get("team_id")
         tstats = stats2[stats2["team_id"] == tid] if "team_id" in stats2.columns else pd.DataFrame()
@@ -258,7 +268,9 @@ def _build_group_standings(teams: pd.DataFrame, stats: pd.DataFrame) -> pd.DataF
             "goals_against": ga,
             "goal_diff": gf - ga,
             "points": points,
-            "qualification_status": "qualified" if points >= 6 else ("in_contention" if played < 3 else "eliminated"),
+            # Once knockout fixtures exist, qualification is a fact: did the team play one?
+            "qualification_status": ("qualified" if str(tid) in knockout_teams else "eliminated") if knockout_teams
+            else ("qualified" if points >= 6 else ("in_contention" if played < 3 else "eliminated")),
         })
     df = pd.DataFrame(standings)
     if not df.empty:
@@ -309,7 +321,10 @@ def build_gold() -> dict[str, pd.DataFrame]:
         # Card / penalty / VAR counts only come from source events; null when the API does not report them.
         "total_yellow_cards": _count_events(match_events, "yellow"),
         "total_red_cards": _count_events(match_events, "red"),
-        "penalties_awarded": _count_events(match_events, "penalty"),
+        # The source lists scored penalties only (no misses), so "awarded" is unknown.
+        "penalties_awarded": _count_events(match_events, r"^penalty(_awarded|_missed)?$"),
+        "penalty_goals": _count_events(match_events, r"^penalty_goal$"),
+        "own_goals": _count_events(match_events, r"^own_goal$"),
         "var_goals": _count_events(match_events, "var"),
     }])
 
