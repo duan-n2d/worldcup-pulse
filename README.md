@@ -1,8 +1,33 @@
 # WorldCup Pulse
 
+[![CI](https://github.com/duan-n2d/worldcup-pulse/actions/workflows/ci.yml/badge.svg)](https://github.com/duan-n2d/worldcup-pulse/actions/workflows/ci.yml)
+
+**Live:** [Overview app](https://huggingface.co/spaces/n2d/worldcup-pulse-overview) · [DataOps app](https://huggingface.co/spaces/n2d/worldcup-pulse-dataops) · [Dataset](https://huggingface.co/datasets/n2d/worldcup-pulse-data) (free Spaces sleep when idle; the first load takes about 30 s)
+
 A free-tier, cloud-automated data platform for the FIFA World Cup 2026. A GitHub Actions ETL pulls the WorldCup26 API, builds a Bronze/Silver/Gold Parquet lakehouse, and publishes it to a Hugging Face Dataset as decoupled storage. Two stateless Streamlit apps read from that dataset: a public BI app and a DataOps monitor.
 
 > **Status:** the tournament ended in July 2026. The scheduled refresh is disabled in both the GitHub workflow and the Cloudflare Worker (`crons = []`). You can still run the ETL from the Actions tab or through the token-protected Worker endpoint.
+
+## Results
+
+Measured on the published lakehouse (Bronze snapshot `772e610b`, 1 Aug 2026, after the final):
+
+| | |
+|---|---|
+| Matches | 104 (72 group, 16 R32, 8 R16, 4 QF, 2 SF, 3rd place, final) |
+| Teams / venues | 48 / 16 |
+| Goals from scores | 308 (2.96 per match) |
+| Goal events with a named scorer | 297 (5 penalties, 1 own goal); the source names no scorer for 11 goals |
+| Quality checks | 25 pass, 1 warning (`events.scorer_coverage`) |
+
+## Data provenance
+
+The ETL ran every 30 minutes from 28 Jun 2026 (9,458 dataset commits up to 27 Aug). Two problems were found and fixed afterwards:
+
+1. **Mock data was published.** From 1 Aug 2026 20:28 UTC the API stopped answering, and the original code silently fell back to its sample payload, so the public dataset showed 12 sample matches until now. The pipeline now fails on source errors, and the upload refuses mock runs.
+2. **Silver did not match the real payload.** Team, stage, venue and scorer fields were read from key names the API never used, so stats were also filled in by generated values. Silver now reads the real schema (`home_team_id`, `name_en`, `type`, `local_date`, per-side scorer strings). Stats the API lacks stay null.
+
+The API is now offline (`404`), so the public data was rebuilt with the current code from the last real Bronze snapshot by the [Replay from Bronze](.github/workflows/replay.yml) workflow ([`replay_from_hf.py`](lakehouse/pipelines/replay_from_hf.py)). The replay refuses any snapshot that does not contain all 104 matches.
 
 ## Architecture
 
@@ -28,7 +53,7 @@ flowchart LR
 - **Fail loudly on source errors**: if the API is unreachable, the run fails with a non-zero exit. It does not swap in sample data. Mock data needs an explicit `--use-mock` flag and is never uploaded.
 - **Decoupled storage** — the code repo never commits data; the HF Dataset repo is the only place lakehouse files live.
 - **Medallion layers** in Parquet, read by DuckDB in the apps for fast, serverless queries.
-- **Data quality and auditability** — per-run checks by layer/table and a pipeline run log, surfaced in the DataOps app.
+- **Data quality and auditability** — per-run checks by layer/table (row counts, foreign keys, distinct home/away teams, group standings limited to the round robin, scorer coverage against scores) and a pipeline run log, surfaced in the DataOps app.
 - **Stateless UIs** with a 5-minute cache. If the dataset cannot be read, the apps fall back to built-in sample data and show a prominent **MOCK DATA** banner.
 
 ## Repository layout
@@ -44,7 +69,11 @@ apps/
 docs/
   lakehouse-deployment.md   End-to-end deployment checklist and secrets
   hf-dataset-card.md        Dataset card: lakehouse layout and every gold mart
-.github/workflows/etl.yml   ETL job (dispatch / manual)
+.github/workflows/
+  etl.yml             ETL job (dispatch / manual)
+  replay.yml          Rebuild Silver/Gold from a published Bronze snapshot
+  deploy-spaces.yml   Sync apps/ to the two Hugging Face Spaces
+  ci.yml              Tests on every push
 ```
 
 ## Run locally
@@ -62,6 +91,12 @@ cd lakehouse && python pipelines/run_pipeline.py --source worldcup26 --use-mock 
 ```
 
 The run manifest records mock runs (`used_mock: true`), and the upload step refuses to publish them to Hugging Face. `--mode` is accepted for compatibility and is only recorded; every run is a full pull.
+
+Tests run the whole pipeline offline: the mock payload end to end, plus a fixture in the real API's shape (team-ID resolution, stages, venues, scorer-string parsing, own goals not credited to the player, standings from group matches only):
+
+```bash
+pip install pytest && cd lakehouse && python -m pytest -q tests
+```
 
 To run an app:
 
@@ -89,6 +124,13 @@ curl -X POST -H "Authorization: Bearer $TRIGGER_TOKEN" https://<your-worker>.wor
 ## Gold marts
 
 Tournament KPIs, goals by matchday and minute bucket, host cities, team radar and key metrics, goal-scorer leaderboard, team table, matches, group standings, and match events. [docs/hf-dataset-card.md](docs/hf-dataset-card.md) has column-level descriptions and lists which columns are null when the source does not provide them.
+
+## Honest limits
+
+- The source has no xG, shots, possession, passing, cards, attendance, assists or line-ups, so those stay null.
+- Some player names in the source are mangled transliterations (e.g. "Jvd Blingham"). They are published as received, not corrected by hand.
+- Every run is a full refresh with no incremental watermark; at this data size that is cheaper than tracking state.
+- The live Spaces run the code on `main`, synced by `deploy-spaces.yml`.
 
 ## Tech stack
 
