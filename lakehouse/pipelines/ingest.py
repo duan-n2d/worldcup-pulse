@@ -38,26 +38,27 @@ def _mock_payload() -> dict[str, Any]:
         {"id": 2, "name": "Estadio Azteca", "city": "Mexico City", "country": "Mexico", "lat": 19.3029, "lon": -99.1505},
         {"id": 3, "name": "BC Place", "city": "Vancouver", "country": "Canada", "lat": 49.2768, "lon": -123.1119},
     ]
+    # A single round robin inside each group, then a final; goal lists match the scores.
+    fixtures = [(teams[a], teams[b], "Group", md) for g in (0, 3) for md, (a, b) in enumerate([(g, g + 1), (g, g + 2), (g + 1, g + 2)], 1)]
+    fixtures.append((teams[1], teams[4], "Final", 4))
     games = []
-    for i in range(1, 13):
-        home = teams[(i - 1) % len(teams)]
-        away = teams[(i + 1) % len(teams)]
+    for i, (home, away, stage, matchday) in enumerate(fixtures, 1):
+        home_score, away_score = (i * 2) % 4, i % 3
+        goals = [{"minute": 10 + 7 * k + i, "team": home["name"], "player": f"{home['fifa_code']} Forward", "type": "goal"} for k in range(home_score)]
+        goals += [{"minute": 50 + 9 * k + i, "team": away["name"], "player": f"{away['fifa_code']} Midfielder", "type": "goal"} for k in range(away_score)]
         games.append({
             "id": i,
             "match_number": i,
-            "stage": "Group",
-            "matchday": (i - 1) // 4 + 1,
+            "stage": stage,
+            "matchday": matchday,
             "home_team": home["name"],
             "away_team": away["name"],
-            "home_score": i % 4,
-            "away_score": (i + 1) % 3,
+            "home_score": home_score,
+            "away_score": away_score,
             "status": "finished",
             "stadium": stadiums[i % 3]["name"],
             "city": stadiums[i % 3]["city"],
-            "goals": [
-                {"minute": 12 + i, "team": home["name"], "player": f"{home['fifa_code']} Forward", "type": "goal"},
-                {"minute": 55 + i, "team": away["name"], "player": f"{away['fifa_code']} Midfielder", "type": "goal"},
-            ],
+            "goals": goals,
         })
     return {"teams": teams, "groups": [], "games": games, "stadiums": stadiums}
 

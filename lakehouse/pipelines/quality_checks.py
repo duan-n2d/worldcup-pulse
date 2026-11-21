@@ -31,6 +31,18 @@ def run_quality_checks() -> tuple[pd.DataFrame, bool]:
         _check(rows, "Silver", table_name, "not_empty", len(df) > 0, f"rows={len(df)}", "Warn" if table_name in OPTIONAL_SILVER else "Fail")
         missing = 0 if df.empty or "team_id" not in df.columns else (~df["team_id"].astype(str).isin(valid_teams)).sum()
         _check(rows, "Silver", table_name, "fk_team_id", missing == 0, f"missing_team_refs={int(missing)}")
+    if not matches.empty and {"home_team_id", "away_team_id"}.issubset(matches.columns):
+        both_known = matches["home_team_id"].astype(str).isin(valid_teams) & matches["away_team_id"].astype(str).isin(valid_teams)
+        same = (both_known & matches["home_team_id"].astype(str).eq(matches["away_team_id"].astype(str))).sum()
+        _check(rows, "Silver", "matches", "distinct_teams", same == 0, f"matches_with_same_home_and_away_team={int(same)}")
+    if not teams.empty and "group_name" in teams.columns:
+        unknown = teams["group_name"].astype(str).eq("Unknown").sum()
+        _check(rows, "Silver", "teams", "group_known", unknown == 0, f"teams_without_group={int(unknown)}", "Warn")
+    if not events.empty and not matches.empty and {"home_score", "away_score"}.issubset(matches.columns):
+        goals = int(matches["home_score"].fillna(0).sum() + matches["away_score"].fillna(0).sum())
+        # The source does not always name every scorer; report coverage rather than fail.
+        _check(rows, "Silver", "events", "scorer_coverage", len(events) == goals,
+               f"goal_events={len(events)} goals_from_scores={goals} missing={goals - len(events)}", "Warn")
     gold_tables = [
         "kpi_summary", "goals_by_matchday", "goals_by_minute_bucket", "host_cities",
         "team_radar_stats", "team_key_metrics", "top_players", "team_table",
@@ -44,6 +56,13 @@ def run_quality_checks() -> tuple[pd.DataFrame, bool]:
         allowed = {"completed", "live", "scheduled"}
         bad_status = (~gold_matches["status"].astype(str).str.lower().isin(allowed)).sum()
         _check(rows, "Gold", "matches", "valid_status", bad_status == 0, f"bad_status_rows={int(bad_status)}")
+    standings = read_parquet(GOLD_DIR / "group_standings.parquet")
+    if not standings.empty and {"played", "group"}.issubset(standings.columns):
+        # In a single round robin a team plays (group size - 1) group matches; more means
+        # knockout matches leaked into the standings.
+        limit = standings.groupby("group")["team"].transform("count") - 1
+        over = (standings["played"] > limit).sum()
+        _check(rows, "Gold", "group_standings", "group_stage_only", over == 0, f"teams_over_round_robin_limit={int(over)}")
     gold_events = read_parquet(GOLD_DIR / "match_events.parquet")
     if not gold_events.empty and "match_id" in gold_events.columns and not gold_matches.empty and "match_id" in gold_matches.columns:
         missing_match = (~gold_events["match_id"].astype(str).isin(set(gold_matches["match_id"].astype(str)))).sum()
