@@ -1,0 +1,33 @@
+name: Replay from Bronze
+
+# The WorldCup26 API went offline after the tournament. This rebuilds Silver and Gold
+# with the current code from a Bronze snapshot already in the HF Dataset, runs the
+# quality checks and republishes only if they pass.
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: HF Dataset commit whose bronze/ holds real API data
+        required: true
+        default: 772e610bd926cd2fc87ce7138f737938c5cf7064
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lakehouse
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Replay and publish
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
+          DATA_DIR: data
+        working-directory: lakehouse/pipelines
+        run: python replay_from_hf.py --revision "${{ inputs.revision }}" --upload
