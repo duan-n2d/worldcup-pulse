@@ -1,0 +1,44 @@
+name: Deploy Spaces
+
+# Syncs the two Streamlit apps to their Hugging Face Spaces so the public demo
+# always runs the code on main.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["apps/**"]
+
+concurrency:
+  group: deploy-spaces
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - app: overview
+            space: n2d/worldcup-pulse-overview
+          - app: dataops
+            space: n2d/worldcup-pulse-dataops
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - run: pip install "huggingface_hub>=0.26"
+      - name: Upload apps/${{ matrix.app }} to ${{ matrix.space }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import HfApi
+          HfApi(token=os.environ["HF_TOKEN"]).upload_folder(
+              repo_id="${{ matrix.space }}",
+              repo_type="space",
+              folder_path="apps/${{ matrix.app }}",
+              commit_message="Sync from GitHub ${{ github.sha }}",
+          )
+          PY
